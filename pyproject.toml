@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lcsc-mcp"
+version = "0.1.0"
+description = "MCP server for LCSC/JLCPCB parts database (official API)"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0",
+    "requests>=2.31",
+]
+
+[project.scripts]
+lcsc-mcp = "lcsc_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lcsc_mcp"]
