@@ -227,7 +227,14 @@ class JLCPCBClient:
         while True:
             page += 1
             data = self.get_library_list(library_type=library_type, last_key=last_key)
-            parts = data.get("componentInfos", [])
+
+            # The API may return a bare list instead of {"componentInfos": [...], "lastKey": ...}
+            if isinstance(data, list):
+                parts = data
+                last_key = None
+            else:
+                parts = data.get("componentInfos", [])
+                last_key = data.get("lastKey")
 
             if not parts:
                 break
@@ -238,7 +245,6 @@ class JLCPCBClient:
                 all_parts.extend(parts)
 
             total += len(parts)
-            last_key = data.get("lastKey")
 
             if on_progress:
                 on_progress(total, f"Library page {page}: {total} parts")
