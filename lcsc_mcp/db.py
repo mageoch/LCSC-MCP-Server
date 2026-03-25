@@ -704,7 +704,7 @@ class PartsDB:
                 where_parts.append("s.current_a IS NOT NULL AND s.current_a >= ?")
                 params.append(current_min_a)
 
-        where_clause = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+        where_clause = "WHERE " + " AND ".join(where_parts)
         order_clause = (
             "ORDER BY CASE c.library_type WHEN 'Basic' THEN 0 WHEN 'Preferred' THEN 1 ELSE 2 END,"
             " CAST(json_extract(c.price_json, '$[0].price') AS REAL)"

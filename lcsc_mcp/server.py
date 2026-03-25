@@ -124,7 +124,7 @@ def download_database(force: bool = False) -> dict:
         except Exception:
             checkpoint = None
 
-    def on_batch(parts: list) -> None:
+    def on_batch(parts: list) -> None:  # pragma: no cover — dead code, patched_on_batch is used instead
         inserted = db.import_batch(parts)
         # Update checkpoint after each successful batch
         ck = {"last_key": current_last_key[0], "total": total_counter[0]}

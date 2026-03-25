@@ -16,5 +16,28 @@ dependencies = [
 [project.scripts]
 lcsc-mcp = "lcsc_mcp.server:main"
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.0",
+    "pytest-cov>=5.0",
+    "freezegun>=1.5",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=lcsc_mcp --cov-report=term-missing --cov-branch"
+
+[tool.coverage.run]
+branch = true
+source = ["lcsc_mcp"]
+
+[tool.coverage.report]
+fail_under = 100
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["lcsc_mcp"]
