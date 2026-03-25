@@ -154,3 +154,5 @@ lcsc_mcp/
 ## License
 
 MIT — Copyright (c) 2026 mageo services Ltd. See [LICENSE](LICENSE).
+
+Created and maintained by [@mageo](https://github.com/mageo).
