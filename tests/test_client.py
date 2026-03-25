@@ -172,8 +172,9 @@ def test_get_part_detail_empty_dict(client, mocker):
 
 
 def test_get_part_detail_runtime_error(client, mocker):
-    mocker.patch.object(client, "_post", side_effect=RuntimeError("not found"))
-    assert client.get_part_detail("C00000") is None
+    mocker.patch.object(client, "_post", side_effect=RuntimeError("API error 401: unauthorized"))
+    with pytest.raises(RuntimeError, match="401"):
+        client.get_part_detail("C00000")
 
 
 # ---------------------------------------------------------------------------

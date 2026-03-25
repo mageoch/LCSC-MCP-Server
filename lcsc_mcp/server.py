@@ -511,10 +511,10 @@ def get_part(lcsc_code: str, live: bool = False) -> dict:
         client = _client()
         raw = client.get_part_detail(lcsc_code)
         if not raw:
-            # Fall back to stale cache rather than returning nothing
+            # Part genuinely not found — fall back to stale cache rather than returning nothing
             part = db.get(lcsc_code)
             if part:
-                return {"success": True, "source": "local_db_stale", "part": part}
+                return {"success": True, "source": "local_db_stale", "api_error": "API returned no data for this part", "part": part}
             return {"success": False, "error": f"Part {lcsc_code} not found via API"}
 
         # Upsert into local DB for future queries
@@ -524,11 +524,11 @@ def get_part(lcsc_code: str, live: bool = False) -> dict:
         return {"success": True, "source": "api", "part": part}
 
     except Exception as exc:
-        # Network error — fall back to stale cache if available
+        # Auth/network error — fall back to stale cache if available
+        logger.warning("API error for %s: %s", lcsc_code, exc)
         part = db.get(lcsc_code)
         if part:
-            logger.warning("API error for %s, serving stale cache: %s", lcsc_code, exc)
-            return {"success": True, "source": "local_db_stale", "part": part}
+            return {"success": True, "source": "local_db_stale", "api_error": str(exc), "part": part}
         return {"success": False, "error": str(exc)}
 
 

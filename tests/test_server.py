@@ -503,6 +503,7 @@ def test_get_part_api_returns_none_fallback_stale(mocker):
 
     result = server.get_part("C25744")
     assert result["source"] == "local_db_stale"
+    assert "api_error" in result
 
 
 def test_get_part_api_returns_none_no_cache(mocker):
@@ -531,6 +532,7 @@ def test_get_part_network_error_stale_cache(mocker):
 
     result = server.get_part("C25744")
     assert result["source"] == "local_db_stale"
+    assert "network down" in result["api_error"]
 
 
 def test_get_part_network_error_no_cache(mocker):
