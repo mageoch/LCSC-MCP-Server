@@ -148,17 +148,74 @@ def test_fetch_page_with_key(client, mocker):
 
 
 # ---------------------------------------------------------------------------
+# _normalize_detail
+# ---------------------------------------------------------------------------
+
+_SAMPLE_DETAIL = {
+    "componentCode": "C25744",
+    "firstTypeName": "Resistors",
+    "secondTypeName": "Chip Resistor - Surface Mount",
+    "componentModel": "0402WGF1002TCE",
+    "componentSpecification": "0402",
+    "solderJointCount": 2,
+    "libraryType": "base",
+    "description": "10kΩ ±1% 1/16W",
+    "dataManualUrl": "https://example.com/ds.pdf",
+    "datasheetUrl": "",
+    "stockCount": 1000000,
+    "priceRanges": [
+        {"startQuantity": 1, "endQuantity": 999, "unitPrice": 0.001},
+        {"startQuantity": 1000, "endQuantity": -1, "unitPrice": 0.0008},
+    ],
+}
+
+
+def test_normalize_detail_fields():
+    n = JLCPCBClient._normalize_detail(_SAMPLE_DETAIL)
+    assert n["lcscPart"] == "C25744"
+    assert n["firstCategory"] == "Resistors"
+    assert n["mfrPart"] == "0402WGF1002TCE"
+    assert n["package"] == "0402"
+    assert n["stock"] == 1000000
+    assert n["datasheet"] == "https://example.com/ds.pdf"
+
+
+def test_normalize_detail_price_string():
+    n = JLCPCBClient._normalize_detail(_SAMPLE_DETAIL)
+    # priceRanges → "1-999:0.001,1000-1000:0.0008"
+    assert "1-999:0.001" in n["price"]
+    assert "1000-1000:0.0008" in n["price"]
+
+
+def test_normalize_detail_datasheet_fallback():
+    """Falls back to datasheetUrl when dataManualUrl is absent."""
+    raw = {**_SAMPLE_DETAIL, "dataManualUrl": "", "datasheetUrl": "https://fallback.com/ds.pdf"}
+    n = JLCPCBClient._normalize_detail(raw)
+    assert n["datasheet"] == "https://fallback.com/ds.pdf"
+
+
+def test_normalize_detail_no_price_ranges():
+    raw = {**_SAMPLE_DETAIL, "priceRanges": []}
+    n = JLCPCBClient._normalize_detail(raw)
+    assert n["price"] == ""
+
+
+# ---------------------------------------------------------------------------
 # get_part_detail
 # ---------------------------------------------------------------------------
 
 def test_get_part_detail_found(client, mocker):
-    mocker.patch.object(client, "_post", return_value={"lcscPart": "C25744"})
-    assert client.get_part_detail("C25744")["lcscPart"] == "C25744"
+    mocker.patch.object(client, "_post", return_value=[_SAMPLE_DETAIL])
+    result = client.get_part_detail("C25744")
+    assert result["lcscPart"] == "C25744"
 
 
-def test_get_part_detail_list_response(client, mocker):
-    mocker.patch.object(client, "_post", return_value=[{"lcscPart": "C25744"}])
-    assert client.get_part_detail("C25744")["lcscPart"] == "C25744"
+def test_get_part_detail_uses_correct_param(client, mocker):
+    """API call uses 'componentCodes' list, not 'componentCode' string."""
+    mock_post = mocker.patch.object(client, "_post", return_value=[_SAMPLE_DETAIL])
+    client.get_part_detail("C25744")
+    _, payload = mock_post.call_args[0]
+    assert payload == {"componentCodes": ["C25744"]}
 
 
 def test_get_part_detail_empty_list(client, mocker):
@@ -166,7 +223,8 @@ def test_get_part_detail_empty_list(client, mocker):
     assert client.get_part_detail("C99999") is None
 
 
-def test_get_part_detail_empty_dict(client, mocker):
+def test_get_part_detail_non_list_response(client, mocker):
+    """Unexpected non-list response → None."""
     mocker.patch.object(client, "_post", return_value={})
     assert client.get_part_detail("C00000") is None
 

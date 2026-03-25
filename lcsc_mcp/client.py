@@ -103,17 +103,38 @@ class JLCPCBClient:
             payload["lastKey"] = last_key
         return self._post(ENDPOINT_INFOS, payload)
 
+    @staticmethod
+    def _normalize_detail(raw: dict) -> dict:
+        """Convert getComponentDetailByCode response to import_batch (catalog) format."""
+        price_parts = []
+        for r in raw.get("priceRanges", []):
+            end = r["endQuantity"] if r["endQuantity"] > 0 else r["startQuantity"]
+            price_parts.append(f"{r['startQuantity']}-{end}:{r['unitPrice']}")
+        return {
+            "lcscPart":       raw.get("componentCode"),
+            "firstCategory":  raw.get("firstTypeName"),
+            "secondCategory": raw.get("secondTypeName"),
+            "mfrPart":        raw.get("componentModel"),
+            "package":        raw.get("componentSpecification"),
+            "solderJoint":    raw.get("solderJointCount", 0),
+            "manufacturer":   "",
+            "libraryType":    raw.get("libraryType", ""),
+            "description":    raw.get("description", ""),
+            "datasheet":      raw.get("dataManualUrl") or raw.get("datasheetUrl") or "",
+            "stock":          raw.get("stockCount", 0),
+            "price":          ",".join(price_parts),
+        }
+
     def get_part_detail(self, lcsc_code: str) -> Optional[dict]:
         """
         Fetch live detail for a single component by LCSC code (e.g. 'C25804').
-        Returns the component dict, None if the part genuinely doesn't exist,
+        Returns the component dict normalized to catalog format, None if not found,
         or raises RuntimeError on API/auth errors.
         """
-        data = self._post(ENDPOINT_DETAIL, {"componentCode": lcsc_code})
-        # API returns a single component object or a list depending on version
+        data = self._post(ENDPOINT_DETAIL, {"componentCodes": [lcsc_code]})
         if isinstance(data, list):
-            return data[0] if data else None
-        return data or None
+            return self._normalize_detail(data[0]) if data else None
+        return None
 
     def get_library_list(
         self,
