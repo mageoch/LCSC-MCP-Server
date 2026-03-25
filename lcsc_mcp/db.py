@@ -114,6 +114,56 @@ def _dielectric(desc: str) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 
+# EIA tolerance letter → percent
+_EIA_TOL: dict[str, float] = {
+    'B': 0.1, 'C': 0.25, 'D': 0.5, 'F': 1.0,
+    'G': 2.0, 'J': 5.0, 'K': 10.0, 'M': 20.0,
+}
+
+# Matches UNI-ROYAL / YAGEO part numbers with embedded EIA resistance code:
+#   0402WGF1002TCE  → group(1)="1002" (4-digit EIA), group(2)=None
+#   0402WGF330JTCE  → group(1)="330",  group(2)="J"  (3-digit + tolerance)
+#   0603WAF4702T5E  → group(1)="4702" (4-digit EIA)
+_RE_EIA_RES = re.compile(
+    r'(?:WGF|WAF|WGJ|WGI|WMF|WMJ)(\d{3,4})([BCDFGJKM])?T',
+    re.IGNORECASE,
+)
+
+
+def _resistance_ohms_from_mfr(mfr_part: str) -> Optional[float]:
+    """Parse resistance in Ohms from an EIA-coded manufacturer part number.
+
+    Handles UNI-ROYAL / YAGEO 0402WGF / 0603WAF series:
+    - 4-digit EIA: '1002' → 100 × 10² = 10 kΩ
+    - 3-digit + tolerance letter: '330J' → 33 × 10⁰ = 33 Ω
+    """
+    if not mfr_part:
+        return None
+    m = _RE_EIA_RES.search(mfr_part)
+    if not m:
+        return None
+    code, tol_letter = m.group(1), m.group(2)
+    if len(code) == 4:
+        # 4-digit EIA: first 3 significant, last is multiplier exponent
+        mantissa = int(code[:3])
+        exp = int(code[3])
+    else:
+        # 3-digit EIA: first 2 significant, last is multiplier exponent
+        mantissa = int(code[:2])
+        exp = int(code[2])
+    return mantissa * (10 ** exp)
+
+
+def _tolerance_pct_from_mfr(mfr_part: str) -> Optional[float]:
+    """Extract tolerance from EIA tolerance letter in manufacturer part number."""
+    if not mfr_part:
+        return None
+    m = _RE_EIA_RES.search(mfr_part)
+    if not m or not m.group(2):
+        return None
+    return _EIA_TOL.get(m.group(2).upper())
+
+
 def _component_type(category: str, subcategory: str) -> Optional[str]:
     """Detect passive component type from category strings."""
     combined = f"{category or ''} {subcategory or ''}".lower()
@@ -133,10 +183,14 @@ def _extract_specs(
     description: str,
     category: str,
     subcategory: str,
+    mfr_part: str = '',
 ) -> Optional[tuple]:
     """
     Extract parametric specs from a component row.
     Returns a tuple matching the component_specs INSERT columns, or None.
+
+    When description is empty (common for JLCPCB Basic parts), falls back to
+    parsing the EIA resistance code embedded in mfr_part (e.g. 0402WGF1002TCE).
     """
     ctype = _component_type(category, subcategory)
     if ctype is None:
@@ -146,16 +200,22 @@ def _extract_specs(
 
     if ctype == 'resistor':
         value_si = _resistance_ohms(desc)
+        if value_si is None and mfr_part:
+            value_si = _resistance_ohms_from_mfr(mfr_part)
     elif ctype == 'capacitor':
         value_si = _capacitance_farads(desc)
     else:  # inductor / ferrite
         value_si = _inductance_henries(desc)
 
+    tol = _tolerance_pct(desc)
+    if tol is None and mfr_part and ctype == 'resistor':
+        tol = _tolerance_pct_from_mfr(mfr_part)
+
     return (
         lcsc,
         ctype,
         value_si,
-        _tolerance_pct(desc),
+        tol,
         _voltage_v(desc),
         _current_a(desc),
         _power_w(desc),
@@ -330,7 +390,7 @@ class PartsDB:
 
         spec_rows = []
         for r in rows:
-            s = _extract_specs(r[0], r[8], r[1], r[2])  # lcsc, desc, cat, subcat
+            s = _extract_specs(r[0], r[8], r[1], r[2], r[3] or '')  # lcsc, desc, cat, subcat, mfr_part
             if s:
                 spec_rows.append(s)
         if spec_rows:
@@ -360,12 +420,12 @@ class PartsDB:
         Returns the number of passive components processed.
         """
         rows = self._conn.execute(
-            "SELECT lcsc, description, category, subcategory FROM components"
+            "SELECT lcsc, description, category, subcategory, mfr_part FROM components"
         ).fetchall()
 
         spec_rows = []
         for row in rows:
-            s = _extract_specs(row[0], row[1], row[2], row[3])
+            s = _extract_specs(row[0], row[1], row[2], row[3], row[4] or '')
             if s:
                 spec_rows.append(s)
 
@@ -554,6 +614,13 @@ class PartsDB:
             parser = _parsers.get(component_type.lower())
             if parser:
                 parsed_value = parser(value)
+            # Fallback: bare number → treat as base unit (Ohms for resistors,
+            # Farads for capacitors, Henries for inductors)
+            if parsed_value is None:
+                try:
+                    parsed_value = float(value.replace(',', '.'))
+                except (ValueError, AttributeError):
+                    pass
 
         # Auto-set value_min/max when value is parseable (±0.5 % window)
         _TOL = 0.005

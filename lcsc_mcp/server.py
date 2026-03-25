@@ -596,6 +596,192 @@ def get_stats() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Tool: download_kicad_component
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def download_kicad_component(
+    lcsc_id: str,
+    output: Optional[str] = None,
+    symbol: bool = True,
+    footprint: bool = True,
+    model_3d: bool = True,
+    overwrite: bool = True,
+    model_3d_path: Optional[str] = None,
+) -> dict:
+    """
+    Download KiCAD symbol, footprint, and/or 3D model for an LCSC component.
+
+    Uses the public EasyEDA Pro API (no credentials required) to fetch component
+    data and convert it to KiCAD format.
+
+    Args:
+        lcsc_id: LCSC part number, e.g. 'C25117'.
+        output: Base path for the library files, without extension.
+                Example: '/path/to/hardware/libs/easyeda/EasyEDA'
+                  → symbol  : {output}.kicad_sym
+                  → footprint: {output}.pretty/{name}.kicad_mod
+                  → 3D model : {output}.3dshapes/{name}.wrl/.step
+                Defaults to LCSC_EASYEDA_LIB_PATH env var, then './EasyEDA'.
+        symbol: Download and add symbol to .kicad_sym library. Default: True.
+        footprint: Download and add footprint to .pretty directory. Default: True.
+        model_3d: Download 3D model (.wrl/.step) to .3dshapes directory. Default: True.
+        overwrite: Replace the component if it already exists. Default: True.
+        model_3d_path: Path embedded in the footprint for 3D model references.
+                       Supports KiCAD variables, e.g. '${KICAD_3RD_PARTY}/EasyEDA.3dshapes'.
+                       Defaults to LCSC_EASYEDA_3D_PATH env var, then
+                       '${KICAD_3RD_PARTY}/EasyEDA.3dshapes'.
+
+    Returns:
+        dict with success status, component name, and created file paths.
+    """
+    try:
+        from easyeda2kicad.easyeda.easyeda_api import EasyedaApi
+        from easyeda2kicad.easyeda.easyeda_importer import (
+            Easyeda3dModelImporter,
+            EasyedaFootprintImporter,
+            EasyedaSymbolImporter,
+        )
+        from easyeda2kicad.kicad.export_kicad_3d_model import Exporter3dModelKicad
+        from easyeda2kicad.kicad.export_kicad_footprint import ExporterFootprintKicad
+        from easyeda2kicad.kicad.export_kicad_symbol import ExporterSymbolKicad
+        from easyeda2kicad.kicad.parameters_kicad_symbol import KicadVersion
+        from easyeda2kicad.__main__ import (
+            add_component_in_symbol_lib_file,
+            fp_already_in_footprint_lib,
+            id_already_in_symbol_lib,
+            update_component_in_symbol_lib_file,
+        )
+    except ImportError as exc:
+        return {"success": False, "error": f"easyeda2kicad not installed: {exc}"}
+
+    # Resolve output base path
+    lib_base = output or os.getenv("LCSC_EASYEDA_LIB_PATH") or "./EasyEDA"
+    lib_base = lib_base.rstrip("/")
+
+    # Resolve 3D model path embedded in footprints
+    embedded_3d_path = (
+        model_3d_path
+        or os.getenv("LCSC_EASYEDA_3D_PATH")
+        or "${KICAD_3RD_PARTY}/EasyEDA.3dshapes"
+    )
+
+    # Fetch component data from EasyEDA
+    api = EasyedaApi()
+    cad_data = api.get_cad_data_of_component(lcsc_id=lcsc_id)
+    if not cad_data:
+        return {"success": False, "error": f"No EasyEDA data found for {lcsc_id}"}
+
+    result: dict = {"success": True, "lcsc_id": lcsc_id, "files": {}}
+
+    # ---- Symbol ----
+    if symbol:
+        try:
+            sym_importer = EasyedaSymbolImporter(easyeda_cp_cad_data=cad_data)
+            ee_symbol = sym_importer.get_symbol()
+            sym_lib_path = f"{lib_base}.kicad_sym"
+            footprint_lib_name = Path(lib_base).name
+
+            # Create an empty .kicad_sym library if it doesn't exist yet
+            sym_lib_file = Path(sym_lib_path)
+            sym_lib_file.parent.mkdir(parents=True, exist_ok=True)
+            if not sym_lib_file.exists():
+                sym_lib_file.write_text(
+                    "(kicad_symbol_lib (version 20220914) (generator kicad_symbol_editor)\n)\n",
+                    encoding="utf-8",
+                )
+
+            already_in_lib = id_already_in_symbol_lib(
+                lib_path=sym_lib_path,
+                component_name=ee_symbol.info.name,
+                kicad_version=KicadVersion.v6,
+            )
+
+            exporter = ExporterSymbolKicad(
+                symbol=ee_symbol, kicad_version=KicadVersion.v6
+            )
+            kicad_symbol_lib = exporter.export(footprint_lib_name=footprint_lib_name)
+
+            if already_in_lib:
+                if not overwrite:
+                    result["files"]["symbol"] = {"skipped": True, "path": sym_lib_path}
+                else:
+                    update_component_in_symbol_lib_file(
+                        lib_path=sym_lib_path,
+                        component_name=ee_symbol.info.name,
+                        component_content=kicad_symbol_lib,
+                        kicad_version=KicadVersion.v6,
+                    )
+                    result["files"]["symbol"] = {"updated": True, "path": sym_lib_path, "name": ee_symbol.info.name}
+            else:
+                add_component_in_symbol_lib_file(
+                    lib_path=sym_lib_path,
+                    component_content=kicad_symbol_lib,
+                    kicad_version=KicadVersion.v6,
+                )
+                result["files"]["symbol"] = {"created": True, "path": sym_lib_path, "name": ee_symbol.info.name}
+
+        except Exception as exc:
+            result["files"]["symbol"] = {"error": str(exc)}
+
+    # ---- Footprint ----
+    if footprint:
+        try:
+            fp_importer = EasyedaFootprintImporter(easyeda_cp_cad_data=cad_data)
+            ee_footprint = fp_importer.get_footprint()
+            fp_dir = f"{lib_base}.pretty"
+            fp_filename = f"{ee_footprint.info.name}.kicad_mod"
+            fp_full_path = f"{fp_dir}/{fp_filename}"
+
+            already_in_lib = fp_already_in_footprint_lib(
+                lib_path=fp_dir,
+                package_name=ee_footprint.info.name,
+            )
+
+            if already_in_lib and not overwrite:
+                result["files"]["footprint"] = {"skipped": True, "path": fp_full_path}
+            else:
+                Path(fp_dir).mkdir(parents=True, exist_ok=True)
+                ki_footprint = ExporterFootprintKicad(footprint=ee_footprint)
+                ki_footprint.export(
+                    footprint_full_path=fp_full_path,
+                    model_3d_path=embedded_3d_path,
+                )
+                action = "updated" if already_in_lib else "created"
+                result["files"]["footprint"] = {action: True, "path": fp_full_path, "name": ee_footprint.info.name}
+
+        except Exception as exc:
+            result["files"]["footprint"] = {"error": str(exc)}
+
+    # ---- 3D model ----
+    if model_3d:
+        try:
+            model_importer = Easyeda3dModelImporter(
+                easyeda_cp_cad_data=cad_data, download_raw_3d_model=True
+            )
+            model_exporter = Exporter3dModelKicad(model_3d=model_importer.output)
+            Path(f"{lib_base}.3dshapes").mkdir(parents=True, exist_ok=True)
+            model_exporter.export(lib_path=lib_base)
+
+            shapes_dir = f"{lib_base}.3dshapes"
+            files_created = []
+            if model_exporter.output:
+                files_created.append(f"{shapes_dir}/{model_exporter.output.name}.wrl")
+            if model_exporter.output_step:
+                files_created.append(f"{shapes_dir}/{model_exporter.output.name}.step")
+
+            if files_created:
+                result["files"]["model_3d"] = {"created": True, "paths": files_created}
+            else:
+                result["files"]["model_3d"] = {"skipped": True, "reason": "no 3D model available"}
+
+        except Exception as exc:
+            result["files"]["model_3d"] = {"error": str(exc)}
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 

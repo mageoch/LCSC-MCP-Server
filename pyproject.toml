@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "MCP server for LCSC/JLCPCB parts database (official API)"
 requires-python = ">=3.11"
 dependencies = [
+    "easyeda2kicad>=0.8.0",
     "fastmcp>=2.0",
     "requests>=2.31",
 ]
