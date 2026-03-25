@@ -1,5 +1,7 @@
 # LCSC MCP Server
 
+[![Built with Claude Code](https://img.shields.io/badge/built%20with-Claude%20Code-blueviolet?logo=anthropic&logoColor=white)](https://claude.ai/code)
+
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server for searching and retrieving LCSC/JLCPCB electronic components — using the official JLCPCB API and a local SQLite cache for fast offline queries.
 
 Designed to complement AI-assisted PCB design workflows, particularly alongside [KiCAD-MCP-Server](https://github.com/mageoch/KiCAD-MCP-Server).
