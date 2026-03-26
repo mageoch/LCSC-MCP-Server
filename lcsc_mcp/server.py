@@ -45,6 +45,10 @@ mcp = FastMCP(
 _CHECKPOINT = Path(__file__).parent.parent / "data" / "download_checkpoint.json"
 
 CACHE_TTL_HOURS = float(os.getenv("LCSC_CACHE_TTL_HOURS", "24"))
+# Minimum library age before a forced re-download is attempted on empty search results.
+# Prevents double-downloads when _ensure_basic_library just ran, and avoids hammering
+# the API when a search value genuinely isn't in the Basic library.
+_FORCE_REFRESH_MIN_AGE_HOURS = 1.0
 
 
 def _db() -> PartsDB:
@@ -87,6 +91,44 @@ def _ensure_basic_library(db: PartsDB) -> Optional[str]:
     except Exception as exc:
         logger.warning("Basic library auto-refresh failed: %s", exc)
         return f"Auto-refresh failed ({exc}); results may be stale."
+
+
+def _force_refresh_library(db: PartsDB) -> Optional[str]:
+    """
+    Force-refresh the Basic library from the API when a parametric search returns
+    no local results.
+
+    Skips the re-download if the library was refreshed less than
+    _FORCE_REFRESH_MIN_AGE_HOURS ago — this prevents double-downloads when
+    _ensure_basic_library just ran, and avoids hammering the API when the searched
+    value simply isn't in the Basic library.
+
+    Returns None on success (or skip), or a warning string on failure.
+    """
+    age_h = db.library_age_hours()
+    if age_h is not None and age_h < _FORCE_REFRESH_MIN_AGE_HOURS:
+        logger.debug("Basic library is %.2f h old — skipping force-refresh.", age_h)
+        return None
+
+    logger.info("No local results — force-refreshing Basic library from API…")
+    try:
+        client = _client()
+        total = 0
+
+        def on_batch(parts: list) -> None:
+            nonlocal total
+            total += db.import_batch(parts)
+
+        client.download_library(library_type="base", on_batch=on_batch)
+        db.rebuild_fts()
+        db.rebuild_specs()
+        import time as _time
+        db.set_metadata("basic_library_refreshed_at", str(_time.time()))
+        logger.info("Basic library force-refreshed: %d parts", total)
+        return None
+    except Exception as exc:
+        logger.warning("Basic library force-refresh failed: %s", exc)
+        return f"API search failed ({exc}); no results found."
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +326,10 @@ def search_resistors(
     limit: int = 20,
 ) -> dict:
     """
-    Search resistors in the local LCSC database with parametric filters.
+    Search resistors with parametric filters.
 
+    Searches the local database first. If no results are found locally, automatically
+    fetches the latest Basic library from the JLCPCB API and retries the search.
     Text filters use full-text search against JLCPCB descriptions.
     Numeric range filters use the extracted component_specs table (run
     rebuild_component_specs first if the DB was downloaded before this feature).
@@ -322,6 +366,27 @@ def search_resistors(
         in_stock=in_stock,
         limit=limit,
     )
+    if not parts:
+        api_warning = _force_refresh_library(db)
+        if api_warning is None:
+            parts = db.search_passive(
+                component_type="resistor",
+                value=value,
+                value_min=value_min_ohms,
+                value_max=value_max_ohms,
+                package=package,
+                tolerance=tolerance,
+                tolerance_max_pct=tolerance_max_pct,
+                power_rating=power_rating,
+                power_min_w=power_min_w,
+                library_type=library_type,
+                in_stock=in_stock,
+                limit=limit,
+            )
+            if parts:
+                warning = "No local results; fetched from API."
+        else:
+            warning = api_warning
     result: dict = {"success": True, "count": len(parts), "parts": parts}
     if warning:
         result["warning"] = warning
@@ -347,8 +412,10 @@ def search_capacitors(
     limit: int = 20,
 ) -> dict:
     """
-    Search capacitors in the local LCSC database with parametric filters.
+    Search capacitors with parametric filters.
 
+    Searches the local database first. If no results are found locally, automatically
+    fetches the latest Basic library from the JLCPCB API and retries the search.
     Text filters use full-text search against JLCPCB descriptions.
     Numeric range filters use the extracted component_specs table (run
     rebuild_component_specs first if the DB was downloaded before this feature).
@@ -385,6 +452,27 @@ def search_capacitors(
         in_stock=in_stock,
         limit=limit,
     )
+    if not parts:
+        api_warning = _force_refresh_library(db)
+        if api_warning is None:
+            parts = db.search_passive(
+                component_type="capacitor",
+                value=value,
+                value_min=value_min_farads,
+                value_max=value_max_farads,
+                package=package,
+                tolerance=tolerance,
+                voltage_rating=voltage_rating,
+                voltage_min_v=voltage_min_v,
+                dielectric=dielectric,
+                library_type=library_type,
+                in_stock=in_stock,
+                limit=limit,
+            )
+            if parts:
+                warning = "No local results; fetched from API."
+        else:
+            warning = api_warning
     result: dict = {"success": True, "count": len(parts), "parts": parts}
     if warning:
         result["warning"] = warning
@@ -409,8 +497,10 @@ def search_inductors(
     limit: int = 20,
 ) -> dict:
     """
-    Search inductors (and ferrite beads) in the local LCSC database with parametric filters.
+    Search inductors (and ferrite beads) with parametric filters.
 
+    Searches the local database first. If no results are found locally, automatically
+    fetches the latest Basic library from the JLCPCB API and retries the search.
     Text filters use full-text search against JLCPCB descriptions.
     Numeric range filters use the extracted component_specs table (run
     rebuild_component_specs first if the DB was downloaded before this feature).
@@ -445,6 +535,26 @@ def search_inductors(
         in_stock=in_stock,
         limit=limit,
     )
+    if not parts:
+        api_warning = _force_refresh_library(db)
+        if api_warning is None:
+            parts = db.search_passive(
+                component_type="inductor",
+                value=value,
+                value_min=value_min_henries,
+                value_max=value_max_henries,
+                package=package,
+                tolerance=tolerance,
+                current_rating=current_rating,
+                current_min_a=current_min_a,
+                library_type=library_type,
+                in_stock=in_stock,
+                limit=limit,
+            )
+            if parts:
+                warning = "No local results; fetched from API."
+        else:
+            warning = api_warning
     result: dict = {"success": True, "count": len(parts), "parts": parts}
     if warning:
         result["warning"] = warning
