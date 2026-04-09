@@ -247,12 +247,20 @@ def test_get_library_list_no_filter(client, mocker):
     assert "lastKey" not in payload
 
 
-def test_get_library_list_with_type_and_key(client, mocker):
-    mock_post = mocker.patch.object(client, "_post", return_value={})
-    client.get_library_list(library_type="base", last_key="k1")
+def test_get_library_list_with_type_and_page(client, mocker):
+    mock_post = mocker.patch.object(client, "_post", return_value=[])
+    client.get_library_list(library_type="base", current_page=2, page_size=500)
     _, payload = mock_post.call_args[0]
     assert payload["libraryType"] == "base"
-    assert payload["lastKey"] == "k1"
+    assert payload["currentPage"] == 2
+    assert payload["pageSize"] == 500
+    assert "lastKey" not in payload
+
+
+def test_get_library_list_non_list_non_dict(client, mocker):
+    """Non-list, non-dict response (e.g. None) → returns []."""
+    mocker.patch.object(client, "_post", return_value=None)
+    assert client.get_library_list() == []
 
 
 # ---------------------------------------------------------------------------
@@ -332,33 +340,37 @@ def test_download_error_propagates(client, mocker):
 # download_library
 # ---------------------------------------------------------------------------
 
+def _make_stub(code: str) -> dict:
+    return {"componentCode": code, "componentModel": code, "componentSpecification": "SMD"}
+
+
+def _make_detail(code: str) -> dict:
+    return {"componentCode": code, "componentModel": code, "componentSpecification": "SMD",
+            "firstTypeName": "Resistors", "secondTypeName": "Chip", "libraryType": "base",
+            "description": "", "datasheetUrl": "", "solderJointCount": 2,
+            "priceRanges": [{"startQuantity": 1, "endQuantity": 9, "unitPrice": 0.01}],
+            "stockCount": 100}
+
+
 def test_download_library_accumulates(client, mocker):
+    """Full page (1000 stubs) triggers page 2; partial page 2 ends loop."""
     mocker.patch("lcsc_mcp.client.time.sleep")
-    pages = [
-        {"componentInfos": [{"lcscPart": "C1"}, {"lcscPart": "C2"}], "lastKey": "k1"},
-        {"componentInfos": [{"lcscPart": "C3"}], "lastKey": None},
-        {"componentInfos": []},
-    ]
-    mocker.patch.object(client, "get_library_list", side_effect=pages)
+    page1_stubs = [_make_stub(f"C{i}") for i in range(1000)]
+    page2_stubs = [_make_stub("C9999")]
+    mocker.patch.object(client, "get_library_list", side_effect=[page1_stubs, page2_stubs])
+    mocker.patch.object(client, "_post", side_effect=[
+        [_make_detail(s["componentCode"]) for s in page1_stubs],
+        [_make_detail(s["componentCode"]) for s in page2_stubs],
+    ])
     result = client.download_library()
-    assert len(result) == 3
-
-
-def test_download_library_bare_list_response(client, mocker):
-    """API sometimes returns a bare list instead of {componentInfos: [...]}."""
-    mocker.patch("lcsc_mcp.client.time.sleep")
-    mocker.patch.object(client, "get_library_list", return_value=[{"lcscPart": "C1"}])
-    result = client.download_library()
-    assert len(result) == 1
+    assert len(result) == 1001
 
 
 def test_download_library_with_callback(client, mocker):
     mocker.patch("lcsc_mcp.client.time.sleep")
-    pages = [
-        {"componentInfos": [{"lcscPart": "C1"}], "lastKey": None},
-        {"componentInfos": []},
-    ]
-    mocker.patch.object(client, "get_library_list", side_effect=pages)
+    stubs = [_make_stub("C1")]
+    mocker.patch.object(client, "get_library_list", side_effect=[stubs, []])
+    mocker.patch.object(client, "_post", return_value=[_make_detail("C1")])
     batches = []
     result = client.download_library(on_batch=lambda p: batches.append(p))
     assert result == []
@@ -367,23 +379,42 @@ def test_download_library_with_callback(client, mocker):
 
 def test_download_library_progress(client, mocker):
     mocker.patch("lcsc_mcp.client.time.sleep")
-    pages = [
-        {"componentInfos": [{"lcscPart": "C1"}], "lastKey": None},
-        {"componentInfos": []},
-    ]
-    mocker.patch.object(client, "get_library_list", side_effect=pages)
+    stubs = [_make_stub("C1")]
+    mocker.patch.object(client, "get_library_list", side_effect=[stubs, []])
+    mocker.patch.object(client, "_post", return_value=[_make_detail("C1")])
     calls = []
     client.download_library(on_progress=lambda t, m: calls.append(t))
     assert calls == [1]
 
 
-def test_download_library_empty_parts_with_last_key(client, mocker):
-    """Empty componentInfos with a pending lastKey → break on 'if not parts' (line 240)."""
+def test_download_library_empty_first_page(client, mocker):
+    """Empty first page → returns nothing without calling detail endpoint."""
     mocker.patch("lcsc_mcp.client.time.sleep")
-    pages = [
-        {"componentInfos": [{"lcscPart": "C1"}], "lastKey": "k1"},
-        {"componentInfos": [], "lastKey": "k2"},  # empty → break before last_key check
-    ]
-    mocker.patch.object(client, "get_library_list", side_effect=pages)
+    mocker.patch.object(client, "get_library_list", return_value=[])
+    post_mock = mocker.patch.object(client, "_post")
     result = client.download_library()
-    assert len(result) == 1
+    assert result == []
+    post_mock.assert_not_called()
+
+
+def test_download_library_non_list_detail_response(client, mocker):
+    """_post returns non-list for detail endpoint → parts = [], no import."""
+    mocker.patch("lcsc_mcp.client.time.sleep")
+    stubs = [_make_stub("C1")]
+    mocker.patch.object(client, "get_library_list", side_effect=[stubs, []])
+    mocker.patch.object(client, "_post", return_value={"unexpected": "dict"})
+    result = client.download_library()
+    assert result == []
+
+
+def test_download_library_detail_enrichment(client, mocker):
+    """Verifies codes are passed to ENDPOINT_DETAIL and results are normalized."""
+    mocker.patch("lcsc_mcp.client.time.sleep")
+    stubs = [_make_stub("C580905"), _make_stub("C110499")]
+    mocker.patch.object(client, "get_library_list", side_effect=[stubs, []])
+    detail_raw = [_make_detail("C580905"), _make_detail("C110499")]
+    post_mock = mocker.patch.object(client, "_post", return_value=detail_raw)
+    result = client.download_library()
+    assert len(result) == 2
+    codes_sent = post_mock.call_args[0][1]["componentCodes"]
+    assert set(codes_sent) == {"C580905", "C110499"}

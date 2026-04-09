@@ -48,18 +48,16 @@ def test_ensure_fresh(mocker):
 
 
 def test_ensure_stale_age_none(mocker):
-    """Stale with age=None (never fetched) → on_batch called → line 78 covered."""
+    """Stale with age=None (never fetched) → download_library called → parts imported."""
     mock_db = mocker.MagicMock()
     mock_db.is_library_stale.return_value = True
     mock_db.library_age_hours.return_value = None
 
     mock_client = mocker.MagicMock()
-
-    def fake_download_library(library_type=None, on_batch=None, on_progress=None):
+    def _dl(library_type=None, on_batch=None, on_progress=None):
         if on_batch:
             on_batch([{"lcscPart": "C1"}])
-
-    mock_client.download_library.side_effect = fake_download_library
+    mock_client.download_library.side_effect = _dl
     mocker.patch("lcsc_mcp.server._client", return_value=mock_client)
 
     result = server._ensure_basic_library(mock_db)
@@ -68,16 +66,17 @@ def test_ensure_stale_age_none(mocker):
 
 
 def test_ensure_stale_with_age(mocker):
-    """Stale with age set → logs 'refreshing'."""
+    """Stale with age set → background refresh started → warning returned."""
     mock_db = mocker.MagicMock()
     mock_db.is_library_stale.return_value = True
     mock_db.library_age_hours.return_value = 30.0
 
-    mock_client = mocker.MagicMock()
-    mocker.patch("lcsc_mcp.server._client", return_value=mock_client)
+    mock_bg = mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=True)
 
     result = server._ensure_basic_library(mock_db)
-    assert result is None
+    assert result is not None
+    assert "background" in result.lower()
+    mock_bg.assert_called_once()
 
 
 def test_ensure_stale_client_error(mocker):
@@ -88,23 +87,57 @@ def test_ensure_stale_client_error(mocker):
 
     result = server._ensure_basic_library(mock_db)
     assert result is not None
-    assert "Auto-refresh failed" in result
+    assert "failed" in result
 
 
-def test_ensure_stale_download_error(mocker):
+def test_ensure_stale_already_running(mocker):
+    """Stale with age set but refresh already running → in-progress message."""
     mock_db = mocker.MagicMock()
     mock_db.is_library_stale.return_value = True
     mock_db.library_age_hours.return_value = 30.0
 
-    mock_client = mocker.MagicMock()
-    mock_client.download_library.side_effect = RuntimeError("API down")
-    mocker.patch("lcsc_mcp.server._client", return_value=mock_client)
+    mock_bg = mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=False)
 
     result = server._ensure_basic_library(mock_db)
-    assert "Auto-refresh failed" in result
+    assert result is not None
+    assert "already in progress" in result.lower()
+    mock_bg.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
+# _maybe_bg_refresh_on_empty
+# ---------------------------------------------------------------------------
+
+def test_maybe_bg_refresh_library_fresh(mocker):
+    """Library is fresh → return None (genuine empty result)."""
+    mock_db = mocker.MagicMock()
+    mock_db.is_library_stale.return_value = False
+    result = server._maybe_bg_refresh_on_empty(mock_db)
+    assert result is None
+
+
+def test_maybe_bg_refresh_stale_started(mocker):
+    """Library stale → background refresh started → warning returned."""
+    mock_db = mocker.MagicMock()
+    mock_db.is_library_stale.return_value = True
+    mock_bg = mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=True)
+    result = server._maybe_bg_refresh_on_empty(mock_db)
+    assert result is not None
+    assert "re-run" in result
+    mock_bg.assert_called_once()
+
+
+def test_maybe_bg_refresh_stale_already_running(mocker):
+    """Library stale but refresh already running → in-progress message."""
+    mock_db = mocker.MagicMock()
+    mock_db.is_library_stale.return_value = True
+    mock_bg = mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=False)
+    result = server._maybe_bg_refresh_on_empty(mock_db)
+    assert result is not None
+    assert "already in progress" in result
+    mock_bg.assert_called_once()
+
+
 # _force_refresh_library
 # ---------------------------------------------------------------------------
 
@@ -112,12 +145,10 @@ def test_force_refresh_success(mocker):
     mock_db = mocker.MagicMock()
     mock_db.library_age_hours.return_value = 2.0  # older than 1 h → proceed
     mock_client = mocker.MagicMock()
-
-    def fake_download_library(library_type=None, on_batch=None, on_progress=None):
+    def _dl(library_type=None, on_batch=None, on_progress=None):
         if on_batch:
             on_batch([{"lcscPart": "C1"}])
-
-    mock_client.download_library.side_effect = fake_download_library
+    mock_client.download_library.side_effect = _dl
     mocker.patch("lcsc_mcp.server._client", return_value=mock_client)
 
     result = server._force_refresh_library(mock_db)
@@ -141,10 +172,11 @@ def test_force_refresh_skipped_when_fresh(mocker):
 
 
 def test_force_refresh_proceeds_when_never_downloaded(mocker):
-    """Library never downloaded (age = None) → proceed even though age < threshold."""
+    """Library never downloaded (age = None) → proceed."""
     mock_db = mocker.MagicMock()
     mock_db.library_age_hours.return_value = None  # never fetched
     mock_client = mocker.MagicMock()
+    mock_client.download_library.return_value = []
     mocker.patch("lcsc_mcp.server._client", return_value=mock_client)
 
     result = server._force_refresh_library(mock_db)
@@ -159,7 +191,7 @@ def test_force_refresh_client_error(mocker):
 
     result = server._force_refresh_library(mock_db)
     assert result is not None
-    assert "API search failed" in result
+    assert "API refresh failed" in result
 
 
 def test_force_refresh_download_error(mocker):
@@ -171,7 +203,48 @@ def test_force_refresh_download_error(mocker):
 
     result = server._force_refresh_library(mock_db)
     assert result is not None
-    assert "API search failed" in result
+    assert "API refresh failed" in result
+
+
+# ---------------------------------------------------------------------------
+# _start_background_refresh
+# ---------------------------------------------------------------------------
+
+def test_start_background_refresh_starts_thread(mocker):
+    """First call starts a background thread and returns True."""
+    # Reset module-level state
+    import lcsc_mcp.server as srv
+    srv._bg_refresh_running = False
+    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value=None)
+    mocker.patch("lcsc_mcp.server.PartsDB")
+
+    started = server._start_background_refresh(None)
+    assert started is True
+
+
+def test_start_background_refresh_db_error(mocker):
+    """PartsDB() raises → exception caught, _bg_refresh_running reset to False."""
+    import lcsc_mcp.server as srv
+    srv._bg_refresh_running = False
+    mocker.patch("lcsc_mcp.server.PartsDB", side_effect=RuntimeError("db error"))
+
+    started = server._start_background_refresh(None)
+    assert started is True
+    # Give the background thread time to finish
+    import time
+    time.sleep(0.1)
+    assert srv._bg_refresh_running is False
+
+
+def test_start_background_refresh_already_running(mocker):
+    """Second concurrent call returns False without starting another thread."""
+    import lcsc_mcp.server as srv
+    srv._bg_refresh_running = True
+    try:
+        started = server._start_background_refresh(None)
+        assert started is False
+    finally:
+        srv._bg_refresh_running = False
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +472,30 @@ def test_search_parts_with_warning(mocker):
     assert result["warning"] == "results may be stale"
 
 
+def test_search_parts_live_starts_background_refresh(mocker):
+    """live=True triggers background refresh and returns current DB results immediately."""
+    mock_db = mocker.MagicMock()
+    mock_db.search.return_value = [{"lcsc": "C1"}]
+    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
+    mock_bg = mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=True)
+
+    result = server.search_parts(query="resistor", live=True)
+    assert result["success"] is True
+    mock_bg.assert_called_once()
+    assert "background" in result["warning"].lower()
+
+
+def test_search_parts_live_already_running(mocker):
+    """live=True when refresh already running returns 'already in progress' warning."""
+    mock_db = mocker.MagicMock()
+    mock_db.search.return_value = []
+    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
+    mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=False)
+
+    result = server.search_parts(live=True)
+    assert "already in progress" in result["warning"].lower()
+
+
 # ---------------------------------------------------------------------------
 # search_resistors
 # ---------------------------------------------------------------------------
@@ -420,33 +517,34 @@ def test_search_resistors_with_warning(mocker):
     mock_db.search_passive.return_value = []
     mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
     mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value="stale")
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value="api failed")
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty", return_value=None)
 
     result = server.search_resistors()
     assert "warning" in result
 
 
-def test_search_resistors_api_fallback_success(mocker):
-    """Empty local results → force-refresh → retry returns parts → warning set."""
-    mock_db = mocker.MagicMock()
-    mock_db.search_passive.side_effect = [[], [{"lcsc": "C25744"}]]
-    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
-    mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value=None)
-
-    result = server.search_resistors(value="10k")
-    assert result["success"] is True
-    assert result["count"] == 1
-    assert result.get("warning") == "No local results; fetched from API."
-
-
-def test_search_resistors_api_fallback_still_empty(mocker):
-    """Force-refresh succeeds but retry still returns nothing → no warning set."""
+def test_search_resistors_bg_refresh_on_empty_stale(mocker):
+    """Empty local results + stale library → background refresh started → warning."""
     mock_db = mocker.MagicMock()
     mock_db.search_passive.return_value = []
     mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
     mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value=None)
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty",
+                 return_value="No local results found; background refresh started — re-run in ~30s.")
+
+    result = server.search_resistors(value="10k")
+    assert result["success"] is True
+    assert result["count"] == 0
+    assert "re-run" in result["warning"]
+
+
+def test_search_resistors_empty_fresh(mocker):
+    """Empty local results + fresh library → genuinely no results, no warning."""
+    mock_db = mocker.MagicMock()
+    mock_db.search_passive.return_value = []
+    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
+    mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty", return_value=None)
 
     result = server.search_resistors(value="999Mohm")
     assert result["success"] is True
@@ -454,18 +552,41 @@ def test_search_resistors_api_fallback_still_empty(mocker):
     assert "warning" not in result
 
 
-def test_search_resistors_api_fallback_fails(mocker):
-    """Force-refresh fails → api_warning set in result."""
+def test_search_resistors_bg_refresh_already_running(mocker):
+    """Empty results + refresh already in progress → in-progress warning."""
     mock_db = mocker.MagicMock()
     mock_db.search_passive.return_value = []
     mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
     mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value="API search failed (net error); no results found.")
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty",
+                 return_value="No local results found; refresh already in progress — re-run shortly.")
 
     result = server.search_resistors(value="10k")
     assert result["success"] is True
     assert result["count"] == 0
-    assert "API search failed" in result["warning"]
+    assert "already in progress" in result["warning"]
+
+
+def test_search_resistors_live_starts_background_refresh(mocker):
+    mock_db = mocker.MagicMock()
+    mock_db.search_passive.return_value = [{"lcsc": "C25744"}]
+    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
+    mock_bg = mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=True)
+
+    result = server.search_resistors(value="10k", live=True)
+    assert result["success"] is True
+    mock_bg.assert_called_once()
+    assert "background" in result["warning"].lower()
+
+
+def test_search_resistors_live_already_running(mocker):
+    mock_db = mocker.MagicMock()
+    mock_db.search_passive.return_value = []
+    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
+    mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=False)
+
+    result = server.search_resistors(live=True)
+    assert "already in progress" in result["warning"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -488,46 +609,70 @@ def test_search_capacitors_with_warning(mocker):
     mock_db.search_passive.return_value = []
     mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
     mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value="stale")
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value="api failed")
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty", return_value=None)
 
     result = server.search_capacitors()
     assert "warning" in result
 
 
-def test_search_capacitors_api_fallback_success(mocker):
-    mock_db = mocker.MagicMock()
-    mock_db.search_passive.side_effect = [[], [{"lcsc": "C1525"}]]
-    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
-    mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value=None)
-
-    result = server.search_capacitors(value="100nF")
-    assert result["count"] == 1
-    assert result.get("warning") == "No local results; fetched from API."
-
-
-def test_search_capacitors_api_fallback_still_empty(mocker):
+def test_search_capacitors_bg_refresh_on_empty_stale(mocker):
     mock_db = mocker.MagicMock()
     mock_db.search_passive.return_value = []
     mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
     mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value=None)
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty",
+                 return_value="No local results found; background refresh started — re-run in ~30s.")
+
+    result = server.search_capacitors(value="100nF")
+    assert result["count"] == 0
+    assert "re-run" in result["warning"]
+
+
+def test_search_capacitors_empty_fresh(mocker):
+    mock_db = mocker.MagicMock()
+    mock_db.search_passive.return_value = []
+    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
+    mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty", return_value=None)
 
     result = server.search_capacitors(value="999F")
     assert result["count"] == 0
     assert "warning" not in result
 
 
-def test_search_capacitors_api_fallback_fails(mocker):
+def test_search_capacitors_bg_refresh_already_running(mocker):
     mock_db = mocker.MagicMock()
     mock_db.search_passive.return_value = []
     mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
     mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value="API search failed (net error); no results found.")
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty",
+                 return_value="No local results found; refresh already in progress — re-run shortly.")
 
     result = server.search_capacitors(value="100nF")
     assert result["count"] == 0
-    assert "API search failed" in result["warning"]
+    assert "already in progress" in result["warning"]
+
+
+def test_search_capacitors_live_starts_background_refresh(mocker):
+    mock_db = mocker.MagicMock()
+    mock_db.search_passive.return_value = [{"lcsc": "C1525"}]
+    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
+    mock_bg = mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=True)
+
+    result = server.search_capacitors(value="100nF", live=True)
+    assert result["success"] is True
+    mock_bg.assert_called_once()
+    assert "background" in result["warning"].lower()
+
+
+def test_search_capacitors_live_already_running(mocker):
+    mock_db = mocker.MagicMock()
+    mock_db.search_passive.return_value = []
+    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
+    mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=False)
+
+    result = server.search_capacitors(live=True)
+    assert "already in progress" in result["warning"].lower()
 
 
 # ---------------------------------------------------------------------------
@@ -550,46 +695,70 @@ def test_search_inductors_with_warning(mocker):
     mock_db.search_passive.return_value = []
     mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
     mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value="stale")
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value="api failed")
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty", return_value=None)
 
     result = server.search_inductors()
     assert "warning" in result
 
 
-def test_search_inductors_api_fallback_success(mocker):
-    mock_db = mocker.MagicMock()
-    mock_db.search_passive.side_effect = [[], [{"lcsc": "C1044"}]]
-    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
-    mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value=None)
-
-    result = server.search_inductors(value="10nH")
-    assert result["count"] == 1
-    assert result.get("warning") == "No local results; fetched from API."
-
-
-def test_search_inductors_api_fallback_still_empty(mocker):
+def test_search_inductors_bg_refresh_on_empty_stale(mocker):
     mock_db = mocker.MagicMock()
     mock_db.search_passive.return_value = []
     mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
     mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value=None)
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty",
+                 return_value="No local results found; background refresh started — re-run in ~30s.")
+
+    result = server.search_inductors(value="10nH")
+    assert result["count"] == 0
+    assert "re-run" in result["warning"]
+
+
+def test_search_inductors_empty_fresh(mocker):
+    mock_db = mocker.MagicMock()
+    mock_db.search_passive.return_value = []
+    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
+    mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty", return_value=None)
 
     result = server.search_inductors(value="999H")
     assert result["count"] == 0
     assert "warning" not in result
 
 
-def test_search_inductors_api_fallback_fails(mocker):
+def test_search_inductors_bg_refresh_already_running(mocker):
     mock_db = mocker.MagicMock()
     mock_db.search_passive.return_value = []
     mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
     mocker.patch("lcsc_mcp.server._ensure_basic_library", return_value=None)
-    mocker.patch("lcsc_mcp.server._force_refresh_library", return_value="API search failed (net error); no results found.")
+    mocker.patch("lcsc_mcp.server._maybe_bg_refresh_on_empty",
+                 return_value="No local results found; refresh already in progress — re-run shortly.")
 
     result = server.search_inductors(value="10nH")
     assert result["count"] == 0
-    assert "API search failed" in result["warning"]
+    assert "already in progress" in result["warning"]
+
+
+def test_search_inductors_live_starts_background_refresh(mocker):
+    mock_db = mocker.MagicMock()
+    mock_db.search_passive.return_value = [{"lcsc": "C0805"}]
+    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
+    mock_bg = mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=True)
+
+    result = server.search_inductors(value="10nH", live=True)
+    assert result["success"] is True
+    mock_bg.assert_called_once()
+    assert "background" in result["warning"].lower()
+
+
+def test_search_inductors_live_already_running(mocker):
+    mock_db = mocker.MagicMock()
+    mock_db.search_passive.return_value = []
+    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
+    mocker.patch("lcsc_mcp.server._start_background_refresh", return_value=False)
+
+    result = server.search_inductors(live=True)
+    assert "already in progress" in result["warning"].lower()
 
 
 # ---------------------------------------------------------------------------

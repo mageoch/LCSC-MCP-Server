@@ -1,5 +1,35 @@
+import os
+
 import pytest
+
 from lcsc_mcp.db import PartsDB
+
+_REQUIRED_CREDS = ("JLCPCB_APP_ID", "JLCPCB_API_KEY", "JLCPCB_API_SECRET")
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--integration",
+        action="store_true",
+        default=False,
+        help="Run integration tests that call the live JLCPCB API",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--integration"):
+        missing = [v for v in _REQUIRED_CREDS if not os.getenv(v)]
+        if missing:
+            pytest.exit(
+                f"--integration requires env vars: {', '.join(missing)}",
+                returncode=4,
+            )
+        return  # run all tests, including integration
+
+    skip_integration = pytest.mark.skip(reason="pass --integration to run")
+    for item in items:
+        if item.get_closest_marker("integration"):
+            item.add_marker(skip_integration)
 
 
 @pytest.fixture

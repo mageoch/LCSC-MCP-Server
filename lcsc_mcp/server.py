@@ -13,6 +13,7 @@ Optional:
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -50,6 +51,37 @@ CACHE_TTL_HOURS = float(os.getenv("LCSC_CACHE_TTL_HOURS", "24"))
 # the API when a search value genuinely isn't in the Basic library.
 _FORCE_REFRESH_MIN_AGE_HOURS = 1.0
 
+# Background refresh state
+_bg_refresh_lock = threading.Lock()
+_bg_refresh_running = False
+
+
+def _start_background_refresh(db_path: Optional[str]) -> bool:
+    """
+    Start a background refresh if one is not already running.
+    Returns True if a new refresh was started, False if one was already running.
+    """
+    global _bg_refresh_running
+    with _bg_refresh_lock:
+        if _bg_refresh_running:
+            return False
+        _bg_refresh_running = True
+
+    def _run():
+        global _bg_refresh_running
+        try:
+            db = PartsDB(db_path)
+            _force_refresh_library(db, force=True)
+        except Exception as exc:
+            logger.warning("Background refresh error: %s", exc)
+        finally:
+            with _bg_refresh_lock:
+                _bg_refresh_running = False
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return True
+
 
 def _db() -> PartsDB:
     return PartsDB(os.getenv("LCSC_DB_PATH"))
@@ -61,7 +93,9 @@ def _client() -> JLCPCBClient:
 
 def _ensure_basic_library(db: PartsDB) -> Optional[str]:
     """
-    Auto-refresh the Basic library if it is stale (older than CACHE_TTL_HOURS).
+    Auto-refresh the Basic library in the background if it is stale (older than
+    CACHE_TTL_HOURS). Returns immediately with a warning rather than blocking.
+    If the library has never been populated, falls back to a synchronous fetch.
     Returns a warning string if refresh was triggered, None otherwise.
     """
     if not db.is_library_stale(CACHE_TTL_HOURS):
@@ -69,48 +103,53 @@ def _ensure_basic_library(db: PartsDB) -> Optional[str]:
 
     age = db.library_age_hours()
     if age is None:
+        # Library not yet populated — must block on first run.
         logger.info("Basic library not yet populated — fetching from API…")
-    else:
-        logger.info("Basic library is %.1f h old — refreshing…", age)
+        return _force_refresh_library(db, force=True)
 
-    try:
-        client = _client()
-        total = 0
-
-        def on_batch(parts: list) -> None:
-            nonlocal total
-            total += db.import_batch(parts)
-
-        client.download_library(library_type="base", on_batch=on_batch)
-        db.rebuild_fts()
-        db.rebuild_specs()
-        import time as _time
-        db.set_metadata("basic_library_refreshed_at", str(_time.time()))
-        logger.info("Basic library refreshed: %d parts", total)
-        return None
-    except Exception as exc:
-        logger.warning("Basic library auto-refresh failed: %s", exc)
-        return f"Auto-refresh failed ({exc}); results may be stale."
+    # Library exists but is stale — refresh in background to avoid blocking.
+    logger.info("Basic library is %.1f h old — triggering background refresh…", age)
+    started = _start_background_refresh(os.getenv("LCSC_DB_PATH"))
+    if started:
+        return f"Basic library is {age:.1f}h old — background refresh started. Results show current DB state; re-run in ~30s for updated results."
+    return "Basic library refresh already in progress — results show current DB state. Re-run shortly."
 
 
-def _force_refresh_library(db: PartsDB) -> Optional[str]:
+def _maybe_bg_refresh_on_empty(db: PartsDB) -> Optional[str]:
     """
-    Force-refresh the Basic library from the API when a parametric search returns
-    no local results.
+    Called when a search returns zero results. If the library is stale, starts
+    a background refresh and advises the caller to retry. Returns a warning
+    string if a refresh was triggered, None if the library is fresh (genuinely
+    no results).
+    """
+    if not db.is_library_stale(_FORCE_REFRESH_MIN_AGE_HOURS):
+        return None  # Library is recent — this is a genuine empty result.
+    started = _start_background_refresh(os.getenv("LCSC_DB_PATH"))
+    if started:
+        return "No local results found; background refresh started — re-run in ~30s for updated results."
+    return "No local results found; refresh already in progress — re-run shortly."
 
-    Skips the re-download if the library was refreshed less than
-    _FORCE_REFRESH_MIN_AGE_HOURS ago — this prevents double-downloads when
-    _ensure_basic_library just ran, and avoids hammering the API when the searched
-    value simply isn't in the Basic library.
+
+def _force_refresh_library(db: PartsDB, force: bool = False) -> Optional[str]:
+    """
+    Refresh the Basic+Extended assembly library from the getComponentLibraryList
+    endpoint, which is guaranteed to return all assembly-eligible parts.
+
+    Skips the re-fetch if the library was refreshed less than
+    _FORCE_REFRESH_MIN_AGE_HOURS ago, unless force=True.
+
+    Args:
+        force: If True, bypass the minimum-age guard and always refresh.
 
     Returns None on success (or skip), or a warning string on failure.
     """
-    age_h = db.library_age_hours()
-    if age_h is not None and age_h < _FORCE_REFRESH_MIN_AGE_HOURS:
-        logger.debug("Basic library is %.2f h old — skipping force-refresh.", age_h)
-        return None
+    if not force:
+        age_h = db.library_age_hours()
+        if age_h is not None and age_h < _FORCE_REFRESH_MIN_AGE_HOURS:
+            logger.debug("Library is %.2f h old — skipping force-refresh.", age_h)
+            return None
 
-    logger.info("No local results — force-refreshing Basic library from API…")
+    logger.info("Fetching Basic+Extended library from API…")
     try:
         client = _client()
         total = 0
@@ -119,16 +158,17 @@ def _force_refresh_library(db: PartsDB) -> Optional[str]:
             nonlocal total
             total += db.import_batch(parts)
 
-        client.download_library(library_type="base", on_batch=on_batch)
-        db.rebuild_fts()
-        db.rebuild_specs()
+        client.download_library(library_type=None, on_batch=on_batch)
+        if total:
+            db.rebuild_fts()
+            db.rebuild_specs()
         import time as _time
         db.set_metadata("basic_library_refreshed_at", str(_time.time()))
-        logger.info("Basic library force-refreshed: %d parts", total)
+        logger.info("Library refresh complete: %d parts imported", total)
         return None
     except Exception as exc:
-        logger.warning("Basic library force-refresh failed: %s", exc)
-        return f"API search failed ({exc}); no results found."
+        logger.warning("Library refresh failed: %s", exc)
+        return f"API refresh failed ({exc}); results may be incomplete."
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +314,7 @@ def search_parts(
     manufacturer: Optional[str] = None,
     in_stock: bool = True,
     limit: int = 20,
+    live: bool = False,
 ) -> dict:
     """
     Search the local LCSC parts database.
@@ -282,16 +323,25 @@ def search_parts(
         query: Free-text search (e.g. '10k resistor 0603', 'ESP32', 'LDO 3.3V').
         category: Filter by category or subcategory (e.g. 'Resistors', 'Capacitors').
         package: Filter by package (e.g. '0603', 'SOT-23', 'QFN-32').
-        library_type: 'Basic', 'Extended', 'Preferred', or None for all.
+        library_type: 'Basic' or 'Extended' (JLCPCB 'Preferred' is not exposed by the API — use 'Extended'), or None for all.
         manufacturer: Filter by manufacturer name.
         in_stock: Only return parts with stock > 0. Default: True.
         limit: Maximum results. Default: 20.
+        live: Trigger a background refresh of the catalog from the JLCPCB API.
+              Returns current DB results immediately; re-run in ~30s for updated results. Default: False.
 
     Returns:
         List of matching parts with LCSC code, description, price breaks, stock.
     """
     db = _db()
-    warning = _ensure_basic_library(db)
+    if live:
+        started = _start_background_refresh(os.getenv("LCSC_DB_PATH"))
+        if started:
+            warning = "Live refresh started in background — results show current DB state. Re-run in ~30s for updated results."
+        else:
+            warning = "Live refresh already in progress — results show current DB state. Re-run shortly."
+    else:
+        warning = _ensure_basic_library(db)
     parts = db.search(
         query=query,
         category=category,
@@ -324,6 +374,7 @@ def search_resistors(
     library_type: Optional[str] = None,
     in_stock: bool = True,
     limit: int = 20,
+    live: bool = False,
 ) -> dict:
     """
     Search resistors with parametric filters.
@@ -343,15 +394,24 @@ def search_resistors(
         tolerance_max_pct: Maximum tolerance in percent, e.g. 1.0 for ±1 % or better.
         power_rating: Power rating as text, e.g. '1/10W', '1/4W'.
         power_min_w: Minimum power rating in Watts, e.g. 0.25 for 1/4 W.
-        library_type: 'Basic', 'Extended', 'Preferred', or None for all.
+        library_type: 'Basic' or 'Extended' (JLCPCB 'Preferred' is not exposed by the API — use 'Extended'), or None for all.
         in_stock: Only return parts with stock > 0. Default: True.
         limit: Maximum results. Default: 20.
+        live: Trigger a background refresh of the catalog from the JLCPCB API.
+              Returns current DB results immediately; re-run in ~30s for updated results. Default: False.
 
     Returns:
         List of matching resistors with LCSC code, description, package, price, stock.
     """
     db = _db()
-    warning = _ensure_basic_library(db)
+    if live:
+        started = _start_background_refresh(os.getenv("LCSC_DB_PATH"))
+        if started:
+            warning = "Live refresh started in background — results show current DB state. Re-run in ~30s for updated results."
+        else:
+            warning = "Live refresh already in progress — results show current DB state. Re-run shortly."
+    else:
+        warning = _ensure_basic_library(db)
     parts = db.search_passive(
         component_type="resistor",
         value=value,
@@ -366,27 +426,10 @@ def search_resistors(
         in_stock=in_stock,
         limit=limit,
     )
-    if not parts:
-        api_warning = _force_refresh_library(db)
-        if api_warning is None:
-            parts = db.search_passive(
-                component_type="resistor",
-                value=value,
-                value_min=value_min_ohms,
-                value_max=value_max_ohms,
-                package=package,
-                tolerance=tolerance,
-                tolerance_max_pct=tolerance_max_pct,
-                power_rating=power_rating,
-                power_min_w=power_min_w,
-                library_type=library_type,
-                in_stock=in_stock,
-                limit=limit,
-            )
-            if parts:
-                warning = "No local results; fetched from API."
-        else:
-            warning = api_warning
+    if not parts and not live:
+        bg_warning = _maybe_bg_refresh_on_empty(db)
+        if bg_warning:
+            warning = bg_warning
     result: dict = {"success": True, "count": len(parts), "parts": parts}
     if warning:
         result["warning"] = warning
@@ -410,6 +453,7 @@ def search_capacitors(
     library_type: Optional[str] = None,
     in_stock: bool = True,
     limit: int = 20,
+    live: bool = False,
 ) -> dict:
     """
     Search capacitors with parametric filters.
@@ -429,15 +473,24 @@ def search_capacitors(
         voltage_min_v: Minimum voltage rating in Volts, e.g. 50.0.
         dielectric: Dielectric type, e.g. 'X5R', 'X7R', 'C0G', 'NP0', 'Y5V'.
         tolerance: Tolerance as text, e.g. '±10%', '±20%'.
-        library_type: 'Basic', 'Extended', 'Preferred', or None for all.
+        library_type: 'Basic' or 'Extended' (JLCPCB 'Preferred' is not exposed by the API — use 'Extended'), or None for all.
         in_stock: Only return parts with stock > 0. Default: True.
         limit: Maximum results. Default: 20.
+        live: Trigger a background refresh of the catalog from the JLCPCB API.
+              Returns current DB results immediately; re-run in ~30s for updated results. Default: False.
 
     Returns:
         List of matching capacitors with LCSC code, description, package, price, stock.
     """
     db = _db()
-    warning = _ensure_basic_library(db)
+    if live:
+        started = _start_background_refresh(os.getenv("LCSC_DB_PATH"))
+        if started:
+            warning = "Live refresh started in background — results show current DB state. Re-run in ~30s for updated results."
+        else:
+            warning = "Live refresh already in progress — results show current DB state. Re-run shortly."
+    else:
+        warning = _ensure_basic_library(db)
     parts = db.search_passive(
         component_type="capacitor",
         value=value,
@@ -452,27 +505,10 @@ def search_capacitors(
         in_stock=in_stock,
         limit=limit,
     )
-    if not parts:
-        api_warning = _force_refresh_library(db)
-        if api_warning is None:
-            parts = db.search_passive(
-                component_type="capacitor",
-                value=value,
-                value_min=value_min_farads,
-                value_max=value_max_farads,
-                package=package,
-                tolerance=tolerance,
-                voltage_rating=voltage_rating,
-                voltage_min_v=voltage_min_v,
-                dielectric=dielectric,
-                library_type=library_type,
-                in_stock=in_stock,
-                limit=limit,
-            )
-            if parts:
-                warning = "No local results; fetched from API."
-        else:
-            warning = api_warning
+    if not parts and not live:
+        bg_warning = _maybe_bg_refresh_on_empty(db)
+        if bg_warning:
+            warning = bg_warning
     result: dict = {"success": True, "count": len(parts), "parts": parts}
     if warning:
         result["warning"] = warning
@@ -495,6 +531,7 @@ def search_inductors(
     library_type: Optional[str] = None,
     in_stock: bool = True,
     limit: int = 20,
+    live: bool = False,
 ) -> dict:
     """
     Search inductors (and ferrite beads) with parametric filters.
@@ -513,15 +550,24 @@ def search_inductors(
         current_rating: Rated current as text, e.g. '100mA', '1A', '500mA'.
         current_min_a: Minimum current rating in Amperes, e.g. 1.0 for 1 A.
         tolerance: Tolerance as text, e.g. '±10%', '±20%'.
-        library_type: 'Basic', 'Extended', 'Preferred', or None for all.
+        library_type: 'Basic' or 'Extended' (JLCPCB 'Preferred' is not exposed by the API — use 'Extended'), or None for all.
         in_stock: Only return parts with stock > 0. Default: True.
         limit: Maximum results. Default: 20.
+        live: Trigger a background refresh of the catalog from the JLCPCB API.
+              Returns current DB results immediately; re-run in ~30s for updated results. Default: False.
 
     Returns:
         List of matching inductors with LCSC code, description, package, price, stock.
     """
     db = _db()
-    warning = _ensure_basic_library(db)
+    if live:
+        started = _start_background_refresh(os.getenv("LCSC_DB_PATH"))
+        if started:
+            warning = "Live refresh started in background — results show current DB state. Re-run in ~30s for updated results."
+        else:
+            warning = "Live refresh already in progress — results show current DB state. Re-run shortly."
+    else:
+        warning = _ensure_basic_library(db)
     parts = db.search_passive(
         component_type="inductor",
         value=value,
@@ -535,26 +581,10 @@ def search_inductors(
         in_stock=in_stock,
         limit=limit,
     )
-    if not parts:
-        api_warning = _force_refresh_library(db)
-        if api_warning is None:
-            parts = db.search_passive(
-                component_type="inductor",
-                value=value,
-                value_min=value_min_henries,
-                value_max=value_max_henries,
-                package=package,
-                tolerance=tolerance,
-                current_rating=current_rating,
-                current_min_a=current_min_a,
-                library_type=library_type,
-                in_stock=in_stock,
-                limit=limit,
-            )
-            if parts:
-                warning = "No local results; fetched from API."
-        else:
-            warning = api_warning
+    if not parts and not live:
+        bg_warning = _maybe_bg_refresh_on_empty(db)
+        if bg_warning:
+            warning = bg_warning
     result: dict = {"success": True, "count": len(parts), "parts": parts}
     if warning:
         result["warning"] = warning
@@ -711,7 +741,7 @@ def get_stats() -> dict:
 
 @mcp.tool()
 def download_kicad_component(
-    lcsc_id: str,
+    lcsc_code: str,
     output: Optional[str] = None,
     symbol: bool = True,
     footprint: bool = True,
@@ -726,7 +756,7 @@ def download_kicad_component(
     data and convert it to KiCAD format.
 
     Args:
-        lcsc_id: LCSC part number, e.g. 'C25117'.
+        lcsc_code: LCSC part number, e.g. 'C25117'.
         output: Base path for the library files, without extension.
                 Example: '/path/to/hardware/libs/easyeda/EasyEDA'
                   → symbol  : {output}.kicad_sym
@@ -777,12 +807,18 @@ def download_kicad_component(
     )
 
     # Fetch component data from EasyEDA
+    # Note: EasyEDA blocks requests with the default "easyeda2kicad" User-Agent;
+    # override with a generic browser UA to avoid getting an empty HTML response.
     api = EasyedaApi()
-    cad_data = api.get_cad_data_of_component(lcsc_id=lcsc_id)
+    api.headers["User-Agent"] = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+    cad_data = api.get_cad_data_of_component(lcsc_id=lcsc_code)
     if not cad_data:
-        return {"success": False, "error": f"No EasyEDA data found for {lcsc_id}"}
+        return {"success": False, "error": f"No EasyEDA data found for {lcsc_code}"}
 
-    result: dict = {"success": True, "lcsc_id": lcsc_id, "files": {}}
+    result: dict = {"success": True, "lcsc_code": lcsc_code, "files": {}}
 
     # ---- Symbol ----
     if symbol:
