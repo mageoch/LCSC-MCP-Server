@@ -158,7 +158,7 @@ def _force_refresh_library(db: PartsDB, force: bool = False) -> Optional[str]:
             nonlocal total
             total += db.import_batch(parts)
 
-        client.download_library(library_type=None, on_batch=on_batch)
+        client.download_library(on_batch=on_batch)
         if total:
             db.rebuild_fts()
             db.rebuild_specs()
@@ -256,26 +256,17 @@ def download_database(force: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def download_library(library_type: str = "all") -> dict:
+def download_library() -> dict:
     """
-    Download only the Basic and/or Extended assembly library (much faster than
-    the full catalog — these are the parts JLCPCB stocks for SMT assembly).
+    Download the full assembly library (Basic + Extended) from the JLCPCB API.
 
-    Args:
-        library_type: "basic" (free assembly), "extended" ($3 setup fee each),
-                      or "all" (both). Default: "all".
+    Much faster than the full catalog — these are the parts JLCPCB stocks for SMT assembly.
 
     Returns:
         Download statistics.
     """
     db = _db()
     client = _client()
-
-    api_type: Optional[str] = None
-    if library_type.lower() == "basic":
-        api_type = "base"
-    elif library_type.lower() == "extended":
-        api_type = "extend"
 
     total = 0
 
@@ -284,12 +275,11 @@ def download_library(library_type: str = "all") -> dict:
         total += db.import_batch(parts)
 
     try:
-        client.download_library(library_type=api_type, on_batch=on_batch)
+        client.download_library(on_batch=on_batch)
         db.rebuild_fts()
         db.rebuild_specs()
         import time as _time
-        if api_type in (None, "base"):
-            db.set_metadata("basic_library_refreshed_at", str(_time.time()))
+        db.set_metadata("basic_library_refreshed_at", str(_time.time()))
         stats = db.stats()
         return {
             "success": True,

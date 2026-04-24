@@ -54,7 +54,7 @@ def test_ensure_stale_age_none(mocker):
     mock_db.library_age_hours.return_value = None
 
     mock_client = mocker.MagicMock()
-    def _dl(library_type=None, on_batch=None, on_progress=None):
+    def _dl(on_batch=None, on_progress=None):
         if on_batch:
             on_batch([{"lcscPart": "C1"}])
     mock_client.download_library.side_effect = _dl
@@ -145,7 +145,7 @@ def test_force_refresh_success(mocker):
     mock_db = mocker.MagicMock()
     mock_db.library_age_hours.return_value = 2.0  # older than 1 h → proceed
     mock_client = mocker.MagicMock()
-    def _dl(library_type=None, on_batch=None, on_progress=None):
+    def _dl(on_batch=None, on_progress=None):
         if on_batch:
             on_batch([{"lcscPart": "C1"}])
     mock_client.download_library.side_effect = _dl
@@ -376,7 +376,7 @@ def test_download_database_error(mocker, tmp_path):
 # download_library
 # ---------------------------------------------------------------------------
 
-def test_download_library_all(mocker):
+def test_download_library_success(mocker):
     mock_db = mocker.MagicMock()
     mock_db.stats.return_value = {"total": 5}
     mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
@@ -384,39 +384,13 @@ def test_download_library_all(mocker):
     mock_client.download_library.return_value = None
     mocker.patch("lcsc_mcp.server._client", return_value=mock_client)
 
-    result = server.download_library(library_type="all")
+    result = server.download_library()
     assert result["success"] is True
-    # api_type=None → set_metadata called
     mock_db.set_metadata.assert_called()
-
-
-def test_download_library_basic(mocker):
-    mock_db = mocker.MagicMock()
-    mock_db.stats.return_value = {}
-    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
-    mock_client = mocker.MagicMock()
-    mocker.patch("lcsc_mcp.server._client", return_value=mock_client)
-
-    server.download_library(library_type="basic")
-    args, kwargs = mock_client.download_library.call_args
-    assert kwargs.get("library_type") == "base"
-    mock_db.set_metadata.assert_called()
-
-
-def test_download_library_extended(mocker):
-    """Extended → api_type='extend' → set_metadata NOT called."""
-    mock_db = mocker.MagicMock()
-    mock_db.stats.return_value = {}
-    mocker.patch("lcsc_mcp.server._db", return_value=mock_db)
-    mock_client = mocker.MagicMock()
-    mocker.patch("lcsc_mcp.server._client", return_value=mock_client)
-
-    server.download_library(library_type="extended")
-    mock_db.set_metadata.assert_not_called()
 
 
 def test_download_library_with_on_batch(mocker):
-    """on_batch callback is called → line 202 covered."""
+    """on_batch callback is called → parts imported."""
     mock_db = mocker.MagicMock()
     mock_db.import_batch.return_value = 2
     mock_db.stats.return_value = {"total": 2}
@@ -424,7 +398,7 @@ def test_download_library_with_on_batch(mocker):
 
     mock_client = mocker.MagicMock()
 
-    def fake_download_library(library_type=None, on_batch=None, on_progress=None):
+    def fake_download_library(on_batch=None, on_progress=None):
         if on_batch:
             on_batch([{"lcscPart": "C1"}, {"lcscPart": "C2"}])
 

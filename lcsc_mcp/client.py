@@ -120,7 +120,7 @@ class JLCPCBClient:
             "manufacturer":   "",
             "libraryType":    raw.get("libraryType", ""),
             "description":    raw.get("description", ""),
-            "datasheet":      raw.get("dataManualUrl") or raw.get("datasheetUrl") or "",
+            "datasheet":      raw.get("datasheetUrl") or "",
             "stock":          raw.get("stockCount", 0),
             "price":          ",".join(price_parts),
         }
@@ -132,36 +132,35 @@ class JLCPCBClient:
         or raises RuntimeError on API/auth errors.
         """
         data = self._post(ENDPOINT_DETAIL, {"componentCodes": [lcsc_code]})
-        if isinstance(data, list):
-            return self._normalize_detail(data[0]) if data else None
-        return None
+        items = (
+            data.get("componentDetailResponseVOList", [])
+            if isinstance(data, dict)
+            else (data if isinstance(data, list) else [])
+        )
+        return self._normalize_detail(items[0]) if items else None
 
     def get_library_list(
         self,
-        library_type: Optional[str] = None,
-        current_page: int = 1,
+        last_key: Optional[str] = None,
         page_size: int = 1000,
-    ) -> list:
+    ) -> tuple[list, Optional[str]]:
         """
-        Fetch one page of the Basic/Extended assembly library list.
+        Fetch one page of the assembly library list (cursor-based pagination).
 
         Args:
-            library_type: 'base' for Basic, 'extend' for Extended, None for all.
-            current_page: Page number (1-based).
-            page_size: Number of records per page (max 1000).
+            last_key: Cursor from the previous response to fetch the next page.
+            page_size: Number of records per page.
 
         Returns:
-            List of component stubs with componentCode, componentModel, componentSpecification.
+            Tuple of (stubs, next_last_key). next_last_key is None on the last page.
         """
-        payload: dict = {"currentPage": current_page, "pageSize": page_size}
-        if library_type:
-            payload["libraryType"] = library_type
+        payload: dict = {"pageSize": page_size}
+        if last_key:
+            payload["lastKey"] = last_key
         data = self._post(ENDPOINT_LIB_LIST, payload)
-        if isinstance(data, list):
-            return data
         if isinstance(data, dict):
-            return data.get("componentInfos", [])
-        return []
+            return data.get("componentLibraryInfoVOS", []), data.get("lastKey")
+        return [], None
 
     def download(
         self,
@@ -228,18 +227,16 @@ class JLCPCBClient:
 
     def download_library(
         self,
-        library_type: Optional[str] = None,
         on_batch: Optional[Callable[[list], None]] = None,
         on_progress: Optional[Callable[[int, str], None]] = None,
     ) -> list:
         """
-        Download the full Basic/Extended library list (much smaller than full catalog).
+        Download the full assembly library list (much smaller than full catalog).
 
-        Uses getComponentLibraryList for pagination (currentPage/pageSize), then enriches
-        each batch with getComponentDetailByCode to get price, stock, and libraryType.
+        Uses getComponentLibraryList cursor pagination, then enriches each batch
+        with getComponentDetailByCode to get price, stock, and libraryType.
 
         Args:
-            library_type: 'base', 'extend', or None for both.
             on_batch: Streaming callback; if None, returns accumulated list.
             on_progress: Optional progress callback.
 
@@ -249,22 +246,24 @@ class JLCPCBClient:
         all_parts: list = []
         total = 0
         page = 0
+        last_key: Optional[str] = None
 
         while True:
             page += 1
-            stubs = self.get_library_list(
-                library_type=library_type,
-                current_page=page,
-                page_size=1000,
-            )
+            stubs, next_key = self.get_library_list(last_key=last_key, page_size=1000)
 
             if not stubs:
                 break
 
             # Enrich with full details (price, stock, libraryType) via getComponentDetailByCode
             codes = [s["componentCode"] for s in stubs if s.get("componentCode")]
-            raw_details = self._post(ENDPOINT_DETAIL, {"componentCodes": codes})
-            parts = [self._normalize_detail(r) for r in raw_details] if isinstance(raw_details, list) else []
+            raw_data = self._post(ENDPOINT_DETAIL, {"componentCodes": codes})
+            raw_details = (
+                raw_data.get("componentDetailResponseVOList", [])
+                if isinstance(raw_data, dict)
+                else (raw_data if isinstance(raw_data, list) else [])
+            )
+            parts = [self._normalize_detail(r) for r in raw_details]
 
             if parts:
                 if on_batch:
@@ -278,8 +277,9 @@ class JLCPCBClient:
             else:
                 logger.info("Library page %d: %d parts", page, total)
 
-            if len(stubs) < 1000:  # last page
+            if not next_key:
                 break
+            last_key = next_key
 
             time.sleep(0.1)
 
