@@ -142,7 +142,7 @@ class JLCPCBClient:
     def get_library_list(
         self,
         last_key: Optional[str] = None,
-        page_size: int = 1000,
+        page_size: int = 100,
     ) -> tuple[list, Optional[str]]:
         """
         Fetch one page of the assembly library list (cursor-based pagination).
@@ -250,7 +250,7 @@ class JLCPCBClient:
 
         while True:
             page += 1
-            stubs, next_key = self.get_library_list(last_key=last_key, page_size=1000)
+            stubs, next_key = self.get_library_list(last_key=last_key, page_size=100)
 
             if not stubs:
                 break
