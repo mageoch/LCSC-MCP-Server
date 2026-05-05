@@ -1,13 +1,13 @@
-"""Tests for lcsc_mcp/client.py."""
+"""Tests for jlcpcb_mcp/client.py."""
 import base64
 import hashlib
 import hmac
 import string
-from unittest.mock import call
 
 import pytest
 
-from lcsc_mcp.client import (
+from jlcpcb_mcp.client import (
+    DETAIL_BATCH_MAX,
     JLCPCBClient,
     _auth_header,
     _nonce,
@@ -56,8 +56,8 @@ def test_sign_correct_hmac():
 
 
 def test_auth_header_format(monkeypatch):
-    monkeypatch.setattr("lcsc_mcp.client._nonce", lambda: "TESTNONCE")
-    monkeypatch.setattr("lcsc_mcp.client.time.time", lambda: 9999)
+    monkeypatch.setattr("jlcpcb_mcp.client._nonce", lambda: "TESTNONCE")
+    monkeypatch.setattr("jlcpcb_mcp.client.time.time", lambda: 9999)
     h = _auth_header("APPID", "ACCESSKEY", "SECRET", "POST", "/ep", "{}")
     assert h.startswith('JOP appid="APPID"')
     assert 'accesskey="ACCESSKEY"' in h
@@ -127,24 +127,6 @@ def test_post_api_error_unknown(client, mocker):
     mocker.patch.object(client._session, "post", return_value=resp)
     with pytest.raises(RuntimeError, match="unknown error"):
         client._post("/ep", {})
-
-
-# ---------------------------------------------------------------------------
-# fetch_page
-# ---------------------------------------------------------------------------
-
-def test_fetch_page_no_key(client, mocker):
-    mock_post = mocker.patch.object(client, "_post", return_value={})
-    client.fetch_page()
-    _, payload = mock_post.call_args[0]
-    assert "lastKey" not in payload
-
-
-def test_fetch_page_with_key(client, mocker):
-    mock_post = mocker.patch.object(client, "_post", return_value={})
-    client.fetch_page(last_key="k123")
-    _, payload = mock_post.call_args[0]
-    assert payload["lastKey"] == "k123"
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +217,61 @@ def test_get_part_detail_runtime_error(client, mocker):
 
 
 # ---------------------------------------------------------------------------
+# get_parts_details (batched)
+# ---------------------------------------------------------------------------
+
+def test_get_parts_details_empty(client, mocker):
+    """Empty input → no API call, empty result."""
+    mock_post = mocker.patch.object(client, "_post")
+    assert client.get_parts_details([]) == []
+    mock_post.assert_not_called()
+
+
+def test_get_parts_details_single_batch(client, mocker):
+    mock_post = mocker.patch.object(
+        client, "_post",
+        return_value={"componentDetailResponseVOList": [_SAMPLE_DETAIL]},
+    )
+    result = client.get_parts_details(["C25744"])
+    assert len(result) == 1
+    assert result[0]["lcscPart"] == "C25744"
+    mock_post.assert_called_once()
+
+
+def test_get_parts_details_chunks_above_limit(client, mocker):
+    """A list of > DETAIL_BATCH_MAX codes is split into multiple API calls."""
+    codes = [f"C{i}" for i in range(DETAIL_BATCH_MAX + 5)]
+    captured: list[list[str]] = []
+
+    def _fake_post(_endpoint, payload):
+        captured.append(list(payload["componentCodes"]))
+        return {"componentDetailResponseVOList": [
+            {**_SAMPLE_DETAIL, "componentCode": c} for c in payload["componentCodes"]
+        ]}
+
+    mocker.patch.object(client, "_post", side_effect=_fake_post)
+    result = client.get_parts_details(codes)
+
+    assert len(result) == DETAIL_BATCH_MAX + 5
+    assert len(captured) == 2
+    assert len(captured[0]) == DETAIL_BATCH_MAX
+    assert len(captured[1]) == 5
+
+
+def test_get_parts_details_handles_list_response(client, mocker):
+    """Some endpoint variants return data as a bare list."""
+    mocker.patch.object(client, "_post", return_value=[_SAMPLE_DETAIL])
+    result = client.get_parts_details(["C25744"])
+    assert len(result) == 1
+
+
+def test_get_parts_details_handles_unexpected_response(client, mocker):
+    """A dict without the expected key returns an empty list, no exception."""
+    mocker.patch.object(client, "_post", return_value={"unexpected": "shape"})
+    assert client.get_parts_details(["C25744"]) == []
+
+
+# ---------------------------------------------------------------------------
 # get_library_list
 # ---------------------------------------------------------------------------
 
@@ -263,76 +300,57 @@ def test_get_library_list_non_dict_response(client, mocker):
 
 
 # ---------------------------------------------------------------------------
-# download
+# iter_library_stubs
 # ---------------------------------------------------------------------------
 
-def test_download_basic(client, mocker):
-    mocker.patch("lcsc_mcp.client.time.sleep")
+def _stub(code: str) -> dict:
+    return {"componentCode": code, "componentModel": code, "componentSpecification": "0402"}
+
+
+def test_iter_library_stubs_paginates(client, mocker):
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
     pages = [
-        {"componentInfos": [{"lcscPart": "C1"}, {"lcscPart": "C2"}], "lastKey": "k1"},
-        {"componentInfos": [{"lcscPart": "C3"}], "lastKey": None},
-        {"componentInfos": []},
+        ([_stub("C1"), _stub("C2")], "cursor_a"),
+        ([_stub("C3")], None),
     ]
-    mocker.patch.object(client, "fetch_page", side_effect=pages)
-
-    batches = []
-    total, last_key = client.download(on_batch=lambda p: batches.append(len(p)))
-    assert total == 3
-    assert last_key is None
-    assert batches == [2, 1]
+    mocker.patch.object(client, "get_library_list", side_effect=pages)
+    result = list(client.iter_library_stubs())
+    assert [s["componentCode"] for s in result] == ["C1", "C2", "C3"]
 
 
-def test_download_resume(client, mocker):
-    mocker.patch("lcsc_mcp.client.time.sleep")
-    mock_fetch = mocker.patch.object(
-        client, "fetch_page",
-        return_value={"componentInfos": [], "lastKey": None},
-    )
-    client.download(
-        on_batch=lambda p: None,
-        checkpoint={"last_key": "resume_key", "total": 10},
-    )
-    mock_fetch.assert_called_with("resume_key")
+def test_iter_library_stubs_stops_on_empty_page(client, mocker):
+    """Empty first page → generator exits cleanly."""
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
+    mocker.patch.object(client, "get_library_list", return_value=([], None))
+    assert list(client.iter_library_stubs()) == []
 
 
-def test_download_no_checkpoint(client, mocker):
-    mocker.patch("lcsc_mcp.client.time.sleep")
-    mock_fetch = mocker.patch.object(
-        client, "fetch_page",
-        return_value={"componentInfos": [], "lastKey": None},
-    )
-    client.download(on_batch=lambda p: None)
-    mock_fetch.assert_called_with(None)
-
-
-def test_download_progress_callback(client, mocker):
-    mocker.patch("lcsc_mcp.client.time.sleep")
+def test_iter_library_stubs_invokes_progress(client, mocker):
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
     pages = [
-        {"componentInfos": [{"lcscPart": "C1"}], "lastKey": None},
-        {"componentInfos": []},
+        ([_stub("C1"), _stub("C2")], "cursor_a"),
+        ([_stub("C3")], None),
     ]
-    mocker.patch.object(client, "fetch_page", side_effect=pages)
-    calls = []
-    client.download(on_batch=lambda p: None, on_progress=lambda t, m: calls.append(t))
-    assert calls == [1]
+    mocker.patch.object(client, "get_library_list", side_effect=pages)
+    progress: list[int] = []
+    list(client.iter_library_stubs(on_progress=progress.append))
+    assert progress == [2, 3]
 
 
-def test_download_no_progress_logs(client, mocker):
-    mocker.patch("lcsc_mcp.client.time.sleep")
-    pages = [
-        {"componentInfos": [{"lcscPart": "C1"}], "lastKey": None},
-        {"componentInfos": []},
-    ]
-    mocker.patch.object(client, "fetch_page", side_effect=pages)
-    mock_log = mocker.patch("lcsc_mcp.client.logger")
-    client.download(on_batch=lambda p: None)
-    mock_log.info.assert_called()
-
-
-def test_download_error_propagates(client, mocker):
-    mocker.patch.object(client, "fetch_page", side_effect=RuntimeError("net error"))
-    with pytest.raises(RuntimeError, match="net error"):
-        client.download(on_batch=lambda p: None)
+def test_iter_library_stubs_passes_cursor(client, mocker):
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
+    mock_get = mocker.patch.object(
+        client, "get_library_list",
+        side_effect=[
+            ([_stub("C1")], "next_key"),
+            ([_stub("C2")], None),
+        ],
+    )
+    list(client.iter_library_stubs(page_size=42))
+    # Two calls: first with last_key=None, second with last_key="next_key"
+    assert mock_get.call_count == 2
+    assert mock_get.call_args_list[0].kwargs == {"last_key": None, "page_size": 42}
+    assert mock_get.call_args_list[1].kwargs == {"last_key": "next_key", "page_size": 42}
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +371,7 @@ def _make_detail(code: str) -> dict:
 
 def test_download_library_accumulates(client, mocker):
     """Non-null lastKey triggers page 2; null lastKey ends loop."""
-    mocker.patch("lcsc_mcp.client.time.sleep")
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
     page1_stubs = [_make_stub(f"C{i}") for i in range(1000)]
     page2_stubs = [_make_stub("C9999")]
     mocker.patch.object(client, "get_library_list", side_effect=[
@@ -369,7 +387,7 @@ def test_download_library_accumulates(client, mocker):
 
 
 def test_download_library_with_callback(client, mocker):
-    mocker.patch("lcsc_mcp.client.time.sleep")
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
     stubs = [_make_stub("C1")]
     mocker.patch.object(client, "get_library_list", side_effect=[(stubs, None)])
     mocker.patch.object(client, "_post", return_value={"componentDetailResponseVOList": [_make_detail("C1")]})
@@ -380,7 +398,7 @@ def test_download_library_with_callback(client, mocker):
 
 
 def test_download_library_progress(client, mocker):
-    mocker.patch("lcsc_mcp.client.time.sleep")
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
     stubs = [_make_stub("C1")]
     mocker.patch.object(client, "get_library_list", side_effect=[(stubs, None)])
     mocker.patch.object(client, "_post", return_value={"componentDetailResponseVOList": [_make_detail("C1")]})
@@ -391,7 +409,7 @@ def test_download_library_progress(client, mocker):
 
 def test_download_library_empty_first_page(client, mocker):
     """Empty first page → returns nothing without calling detail endpoint."""
-    mocker.patch("lcsc_mcp.client.time.sleep")
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
     mocker.patch.object(client, "get_library_list", return_value=([], None))
     post_mock = mocker.patch.object(client, "_post")
     result = client.download_library()
@@ -401,7 +419,7 @@ def test_download_library_empty_first_page(client, mocker):
 
 def test_download_library_non_list_detail_response(client, mocker):
     """_post returns dict without known key for detail endpoint → parts = [], no import."""
-    mocker.patch("lcsc_mcp.client.time.sleep")
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
     stubs = [_make_stub("C1")]
     mocker.patch.object(client, "get_library_list", side_effect=[(stubs, None)])
     mocker.patch.object(client, "_post", return_value={"unexpected": "dict"})
@@ -411,7 +429,7 @@ def test_download_library_non_list_detail_response(client, mocker):
 
 def test_download_library_detail_enrichment(client, mocker):
     """Verifies codes are passed to ENDPOINT_DETAIL and results are normalized."""
-    mocker.patch("lcsc_mcp.client.time.sleep")
+    mocker.patch("jlcpcb_mcp.client.time.sleep")
     stubs = [_make_stub("C580905"), _make_stub("C110499")]
     mocker.patch.object(client, "get_library_list", side_effect=[(stubs, None)])
     detail_raw = [_make_detail("C580905"), _make_detail("C110499")]

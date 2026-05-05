@@ -12,7 +12,7 @@ import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +245,32 @@ EXCLUDED_CATEGORIES: set[str] = {
 _DEFAULT_DB = Path(__file__).parent.parent / "data" / "lcsc_parts.db"
 
 
+def _build_fts_query(query: str) -> str:
+    """Convert a free-text query into FTS5 syntax that's robust to punctuation.
+
+    - Alphanumeric tokens of length >= 2 get a prefix wildcard (``LDO`` → ``LDO*``).
+    - Tokens with non-alphanumeric chars (``3.3V``, ``SOT-23``) become quoted
+      phrases so the FTS5 tokenizer's punctuation-splitting yields an
+      adjacent-phrase match instead of a syntax error.
+    - Single-char alphanumeric tokens are left bare.
+
+    Empty input returns an empty string (caller should fall back to non-FTS).
+    """
+    tokens: list[str] = []
+    for raw in query.split():
+        t = raw.strip("\"'")
+        if not t:
+            continue
+        if any(not c.isalnum() for c in t):
+            # Quote phrase; escape inner double quotes per FTS5 rules.
+            tokens.append('"' + t.replace('"', '""') + '"')
+        elif len(t) >= 2:
+            tokens.append(t + "*")
+        else:
+            tokens.append(t)
+    return " ".join(tokens)
+
+
 def _parse_price(price_str: str) -> list[dict]:
     """Parse 'qty_min-qty_max:price,...' into [{"qty": N, "price": F}, ...]."""
     breaks = []
@@ -309,6 +335,31 @@ class PartsDB:
                 content=components
             )
         """)
+        # FTS5 sync triggers. With content='components' the FTS index stores
+        # rowids referring to the components table; without these triggers,
+        # any INSERT/UPDATE/DELETE on components leaves the inverted index
+        # stale and a JOIN against it can raise 'database disk image is
+        # malformed'. Combined with UPSERT in import_batch (which preserves
+        # rowids), this keeps the FTS table coherent with no manual rebuild.
+        c.executescript("""
+            CREATE TRIGGER IF NOT EXISTS components_fts_ai
+            AFTER INSERT ON components BEGIN
+                INSERT INTO components_fts(rowid, lcsc, description, mfr_part, manufacturer)
+                VALUES (new.rowid, new.lcsc, new.description, new.mfr_part, new.manufacturer);
+            END;
+            CREATE TRIGGER IF NOT EXISTS components_fts_ad
+            AFTER DELETE ON components BEGIN
+                INSERT INTO components_fts(components_fts, rowid, lcsc, description, mfr_part, manufacturer)
+                VALUES ('delete', old.rowid, old.lcsc, old.description, old.mfr_part, old.manufacturer);
+            END;
+            CREATE TRIGGER IF NOT EXISTS components_fts_au
+            AFTER UPDATE ON components BEGIN
+                INSERT INTO components_fts(components_fts, rowid, lcsc, description, mfr_part, manufacturer)
+                VALUES ('delete', old.rowid, old.lcsc, old.description, old.mfr_part, old.manufacturer);
+                INSERT INTO components_fts(rowid, lcsc, description, mfr_part, manufacturer)
+                VALUES (new.rowid, new.lcsc, new.description, new.mfr_part, new.manufacturer);
+            END;
+        """)
         # Parametric specs for passives (resistors, capacitors, inductors…)
         c.execute("""
             CREATE TABLE IF NOT EXISTS component_specs (
@@ -340,11 +391,14 @@ class PartsDB:
 
     def import_batch(self, parts: list[dict]) -> int:
         """
-        Insert/replace a batch from the official JLCPCB API.
+        Upsert a batch from the official JLCPCB API.
         Excludes non-electronic categories.
-        Does NOT rebuild FTS — call rebuild_fts() once after bulk import.
 
-        Returns number of rows inserted.
+        Uses ON CONFLICT DO UPDATE so rowids are preserved on existing rows;
+        combined with the FTS5 sync triggers installed in _init_schema, the
+        FTS index stays consistent without a manual rebuild_fts() call.
+
+        Returns number of rows inserted or updated.
         """
         now = int(datetime.now().timestamp())
         rows = []
@@ -381,11 +435,24 @@ class PartsDB:
             return 0
 
         self._conn.executemany("""
-            INSERT OR REPLACE INTO components (
+            INSERT INTO components (
                 lcsc, category, subcategory, mfr_part, package,
                 solder_joints, manufacturer, library_type, description,
                 datasheet, stock, price_json, last_updated
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(lcsc) DO UPDATE SET
+                category      = excluded.category,
+                subcategory   = excluded.subcategory,
+                mfr_part      = excluded.mfr_part,
+                package       = excluded.package,
+                solder_joints = excluded.solder_joints,
+                manufacturer  = excluded.manufacturer,
+                library_type  = excluded.library_type,
+                description   = excluded.description,
+                datasheet     = excluded.datasheet,
+                stock         = excluded.stock,
+                price_json    = excluded.price_json,
+                last_updated  = excluded.last_updated
         """, rows)
 
         spec_rows = []
@@ -394,6 +461,7 @@ class PartsDB:
             if s:
                 spec_rows.append(s)
         if spec_rows:
+            # component_specs has no FTS dependency, so INSERT OR REPLACE is fine
             self._conn.executemany("""
                 INSERT OR REPLACE INTO component_specs
                     (lcsc, component_type, value_si, tolerance_pct,
@@ -441,12 +509,61 @@ class PartsDB:
         logger.info("Specs rebuilt: %d passive components indexed", len(spec_rows))
         return len(spec_rows)
 
-    def clear(self) -> None:
-        """Delete all components (for full re-download)."""
-        self._conn.execute("DELETE FROM components")
-        self._conn.execute("INSERT INTO components_fts(components_fts) VALUES('rebuild')")
+    # ------------------------------------------------------------------
+    # Membership-diff helpers
+    # ------------------------------------------------------------------
+
+    def get_all_lcsc_codes(self) -> set[str]:
+        """Return the set of all LCSC codes currently stored."""
+        rows = self._conn.execute("SELECT lcsc FROM components").fetchall()
+        return {r[0] for r in rows}
+
+    def delete_codes_not_in(self, valid_codes: Iterable[str]) -> int:
+        """
+        Delete every row whose lcsc is NOT in valid_codes. Used by the membership
+        refresh to purge parts that are no longer part of the assembly library
+        (and to clean up entries left over from earlier full-catalog imports).
+
+        Returns the number of component rows deleted. Does NOT rebuild FTS — the
+        caller is expected to do that once after all writes are done.
+        """
+        codes_list = [(c,) for c in valid_codes if c]
+        if not codes_list:
+            return 0
+        # Use a temp table so we don't hit SQLite's parameter limit (~999) when
+        # diffing tens of thousands of codes.
+        self._conn.execute("DROP TABLE IF EXISTS _valid_codes")
+        self._conn.execute("CREATE TEMP TABLE _valid_codes(lcsc TEXT PRIMARY KEY)")
+        self._conn.executemany("INSERT OR IGNORE INTO _valid_codes(lcsc) VALUES(?)", codes_list)
+        cur = self._conn.execute(
+            "DELETE FROM components WHERE lcsc NOT IN (SELECT lcsc FROM _valid_codes)"
+        )
+        deleted = cur.rowcount
+        self._conn.execute(
+            "DELETE FROM component_specs WHERE lcsc NOT IN (SELECT lcsc FROM _valid_codes)"
+        )
+        self._conn.execute("DROP TABLE _valid_codes")
         self._conn.commit()
-        logger.info("Database cleared")
+        return deleted
+
+    def stale_codes(self, codes: Iterable[str], ttl_hours: float) -> list[str]:
+        """
+        Return the subset of `codes` whose row is missing or whose `last_updated`
+        is older than `ttl_hours`. Used to decide which result rows need a live
+        refresh after a search.
+        """
+        codes = [c for c in codes if c]
+        if not codes:
+            return []
+        cutoff = time.time() - ttl_hours * 3600.0
+        placeholders = ",".join("?" * len(codes))
+        rows = self._conn.execute(
+            f"SELECT lcsc FROM components WHERE lcsc IN ({placeholders}) "
+            f"AND last_updated IS NOT NULL AND last_updated >= ?",
+            codes + [cutoff],
+        ).fetchall()
+        fresh = {r[0] for r in rows}
+        return [c for c in codes if c not in fresh]
 
     # ------------------------------------------------------------------
     # Cache metadata
@@ -501,8 +618,7 @@ class PartsDB:
     ) -> list[dict]:
         """Full-text + parametric search."""
         if query:
-            # Append '*' to each token for prefix matching (e.g. "10k" matches "10kΩ").
-            fts_query = " ".join(t + "*" for t in query.split())
+            fts_query = _build_fts_query(query)
             parts = ["""
                 SELECT c.* FROM components c
                 JOIN components_fts ON components_fts.lcsc = c.lcsc
@@ -535,12 +651,11 @@ class PartsDB:
         parts.append("LIMIT ?")
         params.append(limit)
 
-        try:
-            rows = self._conn.execute(" ".join(parts), params).fetchall()
-            return [self._row_to_dict(r) for r in rows]
-        except Exception as exc:
-            logger.error("Search error: %s", exc)
-            return []
+        # Let sqlite3.DatabaseError (incl. 'database disk image is malformed')
+        # propagate so corruption surfaces in the caller's response instead of
+        # silently returning [].
+        rows = self._conn.execute(" ".join(parts), params).fetchall()
+        return [self._row_to_dict(r) for r in rows]
 
     def get(self, lcsc: str) -> Optional[dict]:
         """Get a single part by LCSC number."""
@@ -712,15 +827,22 @@ class PartsDB:
         sql = f"SELECT c.* {' '.join(from_parts)} {where_clause} {order_clause} LIMIT ?"
         params.append(limit)
 
-        try:
-            rows = self._conn.execute(sql, params).fetchall()
-            return [self._row_to_dict(r) for r in rows]
-        except Exception as exc:
-            logger.error("search_passive error: %s | sql: %s", exc, sql)
-            return []
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._row_to_dict(r) for r in rows]
 
-    def suggest_alternatives(self, lcsc: str, limit: int = 5) -> list[dict]:
-        """Find alternative parts: same category + package, sorted Basic → cheap → in-stock."""
+    def suggest_alternatives(
+        self,
+        lcsc: str,
+        limit: int = 5,
+        value_tolerance_pct: float = 5.0,
+    ) -> list[dict]:
+        """Find alternative parts: same category + package, sorted Basic → cheap → in-stock.
+
+        For passives with a known parametric value (resistance/capacitance/
+        inductance), alternatives are additionally constrained to ±value_tolerance_pct
+        of the reference value — so a 10kΩ resistor doesn't get 0Ω, 33kΩ, etc.
+        proposed as drop-ins.
+        """
         ref = self.get(lcsc)
         if not ref:
             return []
@@ -728,23 +850,54 @@ class PartsDB:
         category = ref.get("subcategory") or ref.get("category")
         package = ref.get("package")
 
-        try:
-            rows = self._conn.execute("""
-                SELECT * FROM components
-                WHERE lcsc != ?
-                  AND (category LIKE ? OR subcategory LIKE ?)
-                  AND package LIKE ?
-                  AND stock > 0
-                ORDER BY
-                    CASE library_type WHEN 'Basic' THEN 0 WHEN 'Preferred' THEN 1 ELSE 2 END,
-                    CAST(json_extract(price_json, '$[0].price') AS REAL),
-                    -stock
-                LIMIT ?
-            """, (lcsc, f"%{category}%", f"%{category}%", f"%{package}%", limit)).fetchall()
-            return [self._row_to_dict(r) for r in rows]
-        except Exception as exc:
-            logger.error("suggest_alternatives error: %s", exc)
-            return []
+        # Pull reference parametric value if present (passives only).
+        ref_specs = self._conn.execute(
+            "SELECT component_type, value_si, dielectric FROM component_specs WHERE lcsc = ?",
+            (lcsc,),
+        ).fetchone()
+
+        ref_type = ref_specs["component_type"] if ref_specs else None
+        ref_value = ref_specs["value_si"] if ref_specs else None
+        ref_dielectric = ref_specs["dielectric"] if ref_specs else None
+
+        sql_parts = ["""
+            SELECT c.* FROM components c
+        """]
+        params: list = []
+
+        if ref_value is not None and ref_value > 0:
+            sql_parts.append("JOIN component_specs s ON s.lcsc = c.lcsc")
+        sql_parts.append("""
+            WHERE c.lcsc != ?
+              AND (c.category LIKE ? OR c.subcategory LIKE ?)
+              AND c.package LIKE ?
+              AND c.stock > 0
+        """)
+        params += [lcsc, f"%{category}%", f"%{category}%", f"%{package}%"]
+
+        if ref_value is not None and ref_value > 0:
+            tol = value_tolerance_pct / 100.0
+            sql_parts.append("AND s.component_type = ?")
+            params.append(ref_type)
+            sql_parts.append("AND s.value_si BETWEEN ? AND ?")
+            params += [ref_value * (1 - tol), ref_value * (1 + tol)]
+            # Match dielectric for ceramic capacitors when known — X7R is not
+            # a drop-in for C0G even at the same nominal capacitance.
+            if ref_type == "capacitor" and ref_dielectric:
+                sql_parts.append("AND (s.dielectric = ? OR s.dielectric IS NULL)")
+                params.append(ref_dielectric)
+
+        sql_parts.append("""
+            ORDER BY
+                CASE c.library_type WHEN 'Basic' THEN 0 WHEN 'Preferred' THEN 1 ELSE 2 END,
+                CAST(json_extract(c.price_json, '$[0].price') AS REAL),
+                -c.stock
+            LIMIT ?
+        """)
+        params.append(limit)
+
+        rows = self._conn.execute("\n".join(sql_parts), params).fetchall()
+        return [self._row_to_dict(r) for r in rows]
 
     def stats(self) -> dict:
         """Return database statistics."""

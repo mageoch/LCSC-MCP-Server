@@ -1,12 +1,13 @@
-"""Tests for lcsc_mcp/db.py — SI parsers and PartsDB."""
+"""Tests for jlcpcb_mcp/db.py — SI parsers and PartsDB."""
 import sqlite3
 import time
 
 import pytest
 from freezegun import freeze_time
 
-from lcsc_mcp.db import (
+from jlcpcb_mcp.db import (
     PartsDB,
+    _build_fts_query,
     _capacitance_farads,
     _component_type,
     _current_a,
@@ -388,7 +389,7 @@ def test_import_batch_empty(mem_db):
 
 
 # ---------------------------------------------------------------------------
-# rebuild_fts / rebuild_specs / clear
+# rebuild_fts / rebuild_specs
 # ---------------------------------------------------------------------------
 
 def test_rebuild_fts(mem_db, sample_parts):
@@ -422,11 +423,129 @@ def test_rebuild_specs_no_passives(mem_db):
     assert count == 0
 
 
-def test_clear(mem_db, sample_parts):
+# ---------------------------------------------------------------------------
+# get_all_lcsc_codes
+# ---------------------------------------------------------------------------
+
+def test_get_all_lcsc_codes_empty(mem_db):
+    assert mem_db.get_all_lcsc_codes() == set()
+
+
+def test_get_all_lcsc_codes_returns_all(mem_db, sample_parts):
     mem_db.import_batch(sample_parts)
-    mem_db.clear()
-    total = mem_db._conn.execute("SELECT COUNT(*) FROM components").fetchone()[0]
-    assert total == 0
+    codes = mem_db.get_all_lcsc_codes()
+    # 5 sample parts, 1 excluded cable → 4
+    assert codes == {"C25744", "C1525", "C1044", "C20734"}
+
+
+# ---------------------------------------------------------------------------
+# delete_codes_not_in
+# ---------------------------------------------------------------------------
+
+def test_delete_codes_not_in_keeps_listed(mem_db, sample_parts):
+    mem_db.import_batch(sample_parts)
+    deleted = mem_db.delete_codes_not_in({"C25744", "C1525"})
+    assert deleted == 2  # C1044 and C20734 dropped
+    remaining = mem_db.get_all_lcsc_codes()
+    assert remaining == {"C25744", "C1525"}
+
+
+def test_delete_codes_not_in_empty_input_no_op(mem_db, sample_parts):
+    """Empty valid set → return 0 without touching the DB (defensive)."""
+    mem_db.import_batch(sample_parts)
+    before = mem_db.get_all_lcsc_codes()
+    deleted = mem_db.delete_codes_not_in([])
+    assert deleted == 0
+    assert mem_db.get_all_lcsc_codes() == before
+
+
+def test_delete_codes_not_in_purges_specs(mem_db, sample_parts):
+    mem_db.import_batch(sample_parts)
+    mem_db.rebuild_specs()
+    mem_db.delete_codes_not_in({"C25744"})
+    spec_codes = {
+        r[0]
+        for r in mem_db._conn.execute("SELECT lcsc FROM component_specs").fetchall()
+    }
+    assert spec_codes <= {"C25744"}
+
+
+def test_delete_codes_not_in_handles_large_set(mem_db):
+    """Stress the temp-table path with > SQLite's parameter limit (~999)."""
+    parts = [
+        {
+            "lcscPart": f"C{i}",
+            "firstCategory": "ICs",
+            "secondCategory": "",
+            "mfrPart": f"M{i}",
+            "package": "0402",
+            "solderJoint": 2,
+            "manufacturer": "X",
+            "libraryType": "base",
+            "description": "",
+            "datasheet": "",
+            "stock": 1,
+            "price": "",
+        }
+        for i in range(2000)
+    ]
+    mem_db.import_batch(parts)
+    keep = {f"C{i}" for i in range(0, 2000, 2)}  # keep evens
+    deleted = mem_db.delete_codes_not_in(keep)
+    assert deleted == 1000
+    assert mem_db.get_all_lcsc_codes() == keep
+
+
+def test_delete_codes_not_in_ignores_falsy(mem_db, sample_parts):
+    """Falsy values in valid_codes are filtered out without crashing."""
+    mem_db.import_batch(sample_parts)
+    mem_db.delete_codes_not_in(["C25744", None, ""])
+    assert mem_db.get_all_lcsc_codes() == {"C25744"}
+
+
+# ---------------------------------------------------------------------------
+# stale_codes
+# ---------------------------------------------------------------------------
+
+def test_stale_codes_empty(mem_db):
+    assert mem_db.stale_codes([], 6.0) == []
+
+
+def test_stale_codes_only_fresh(mem_db, sample_parts):
+    mem_db.import_batch(sample_parts)
+    # All rows just imported → none stale at TTL = 24h
+    assert mem_db.stale_codes(["C25744", "C1525"], 24.0) == []
+
+
+def test_stale_codes_picks_old_rows():
+    db = PartsDB(":memory:")
+    parts = [
+        {
+            "lcscPart": "C1", "firstCategory": "ICs", "secondCategory": "",
+            "mfrPart": "", "package": "", "solderJoint": 0, "manufacturer": "",
+            "libraryType": "base", "description": "", "datasheet": "",
+            "stock": 1, "price": "",
+        },
+    ]
+    with freeze_time("2026-01-01 00:00:00"):
+        db.import_batch(parts)
+    with freeze_time("2026-01-01 10:00:00"):
+        # 10 hours later → stale at TTL=6h, fresh at TTL=24h
+        assert db.stale_codes(["C1"], 6.0) == ["C1"]
+        assert db.stale_codes(["C1"], 24.0) == []
+    db.close()
+
+
+def test_stale_codes_unknown_codes_treated_as_stale(mem_db, sample_parts):
+    """A code that isn't in the DB at all is reported stale (caller will fetch)."""
+    mem_db.import_batch(sample_parts)
+    stale = mem_db.stale_codes(["C25744", "C99999"], 24.0)
+    assert stale == ["C99999"]
+
+
+def test_stale_codes_ignores_falsy_inputs(mem_db, sample_parts):
+    mem_db.import_batch(sample_parts)
+    assert mem_db.stale_codes(["", None, "C25744"], 24.0) == []
 
 
 # ---------------------------------------------------------------------------
@@ -566,11 +685,13 @@ def test_search_in_stock_false(mem_db, sample_parts):
     assert len(results) > 0
 
 
-def test_search_error_returns_empty(mem_db, mocker):
+def test_search_propagates_db_errors(mem_db, mocker):
+    """DB-layer search must NOT swallow corruption; the server layer wraps it."""
     mock_conn = mocker.MagicMock()
     mock_conn.execute.side_effect = sqlite3.OperationalError("forced")
     mem_db._conn = mock_conn
-    assert mem_db.search(query="test") == []
+    with pytest.raises(sqlite3.OperationalError):
+        mem_db.search(query="test")
 
 
 # ---------------------------------------------------------------------------
@@ -775,11 +896,12 @@ def test_search_passive_value_with_explicit_value_max(mem_db, sample_parts):
     assert isinstance(results, list)
 
 
-def test_search_passive_error_returns_empty(mem_db, mocker):
+def test_search_passive_propagates_db_errors(mem_db, mocker):
     mock_conn = mocker.MagicMock()
     mock_conn.execute.side_effect = sqlite3.OperationalError("forced")
     mem_db._conn = mock_conn
-    assert mem_db.search_passive("resistor") == []
+    with pytest.raises(sqlite3.OperationalError):
+        mem_db.search_passive("resistor")
 
 
 # ---------------------------------------------------------------------------
@@ -807,7 +929,7 @@ def test_suggest_alternatives_unknown_part(mem_db):
     assert mem_db.suggest_alternatives("C00000") == []
 
 
-def test_suggest_alternatives_error_returns_empty(mem_db, sample_parts, mocker):
+def test_suggest_alternatives_propagates_db_errors(mem_db, sample_parts, mocker):
     mem_db.import_batch(sample_parts)
     orig_execute = mem_db._conn.execute
 
@@ -822,7 +944,8 @@ def test_suggest_alternatives_error_returns_empty(mem_db, sample_parts, mocker):
     mock_conn = mocker.MagicMock()
     mock_conn.execute.side_effect = selective_raise
     mem_db._conn = mock_conn
-    assert mem_db.suggest_alternatives("C25744") == []
+    with pytest.raises(sqlite3.OperationalError):
+        mem_db.suggest_alternatives("C25744")
 
 
 # ---------------------------------------------------------------------------
@@ -870,5 +993,131 @@ def test_stats_library_age(tmp_path):
 def test_close():
     db = PartsDB(":memory:")
     db.close()
+
+
+# ---------------------------------------------------------------------------
+# _build_fts_query
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("query,expected", [
+    ("LDO", "LDO*"),
+    ("LDO 3.3V", 'LDO* "3.3V"'),
+    ("LDO 3.3V SOT-23", 'LDO* "3.3V" "SOT-23"'),
+    ("a", "a"),                 # single-char token left bare
+    ("10kΩ", "10kΩ*"),          # unicode letter is alnum
+    ('say "hi"', 'say* hi*'),   # surrounding double quotes are stripped per token
+    ("USBLC6-2P6", '"USBLC6-2P6"'),
+    ("", ""),
+    ('  "  ', ""),              # only stripped quotes → no tokens
+])
+def test_build_fts_query(query, expected):
+    assert _build_fts_query(query) == expected
+
+
+def test_build_fts_query_escapes_inner_quotes():
+    # An inner double quote must be doubled inside the phrase per FTS5 rules.
+    assert _build_fts_query('a"b.c') == '"a""b.c"'
+
+
+# ---------------------------------------------------------------------------
+# FTS regression — re-importing the same lcsc must keep search FTS-coherent.
+# This is the bug we hit in practice: INSERT OR REPLACE drifted rowids and the
+# FTS index pointed at the wrong rows; the JOIN raised 'database disk image is
+# malformed'. UPSERT + sync triggers fix it.
+# ---------------------------------------------------------------------------
+
+def test_search_after_reimport_stays_consistent(mem_db, sample_parts):
+    mem_db.import_batch(sample_parts)
+    # Re-import the same codes with updated descriptions and stock values.
+    updated = []
+    for p in sample_parts:
+        if p["firstCategory"] == "Wire/Cable/DataCable":
+            continue
+        q = dict(p)
+        q["description"] = q["description"] + " (updated)"
+        q["stock"] = max(q["stock"] // 2, 1)
+        updated.append(q)
+    mem_db.import_batch(updated)
+
+    # FTS+library_type filter — the bug returned 0 here.
+    results = mem_db.search(query="10kΩ", library_type="Basic")
+    assert any(r["lcsc"] == "C25744" for r in results)
+    assert "(updated)" in results[0]["description"]
+
+
+def test_search_finds_phrase_with_punctuation(mem_db, sample_parts):
+    mem_db.import_batch(sample_parts)
+    # Capacitor description has '25V' and '100nF' — phrase with decimal point.
+    results = mem_db.search(query="100nF 25V")
+    assert any(r["lcsc"] == "C1525" for r in results)
+
+
+def test_delete_then_search_does_not_corrupt_fts(mem_db, sample_parts):
+    """Trigger components_fts_ad path: delete a row, FTS should drop its tokens."""
+    mem_db.import_batch(sample_parts)
+    mem_db._conn.execute("DELETE FROM components WHERE lcsc = 'C25744'")
+    mem_db._conn.commit()
+    results = mem_db.search(query="10kΩ")
+    assert all(r["lcsc"] != "C25744" for r in results)
+
+
+# ---------------------------------------------------------------------------
+# suggest_alternatives — parametric matching for passives
+# ---------------------------------------------------------------------------
+
+def test_suggest_alternatives_filters_resistor_by_value(mem_db):
+    """A 10kΩ resistor should NOT propose 1kΩ / 0Ω / 33kΩ as alternatives."""
+    parts = [
+        {"lcscPart": "C25744", "firstCategory": "Resistors", "secondCategory": "Chip Resistor - Surface Mount",
+         "mfrPart": "0402WGF1002TCE", "package": "0402", "solderJoint": 2, "manufacturer": "UNI-ROYAL",
+         "libraryType": "base", "description": "10kΩ ±1%", "datasheet": "", "stock": 1000, "price": "1-100:0.001"},
+        {"lcscPart": "C25101", "firstCategory": "Resistors", "secondCategory": "Chip Resistor - Surface Mount",
+         "mfrPart": "0402WGF1001TCE", "package": "0402", "solderJoint": 2, "manufacturer": "UNI-ROYAL",
+         "libraryType": "extend", "description": "1kΩ ±1%", "datasheet": "", "stock": 500, "price": "1-100:0.001"},
+        # Same value, different supplier → legit alternative.
+        {"lcscPart": "C99001", "firstCategory": "Resistors", "secondCategory": "Chip Resistor - Surface Mount",
+         "mfrPart": "RES-10K-0402", "package": "0402", "solderJoint": 2, "manufacturer": "Other",
+         "libraryType": "extend", "description": "10kΩ ±1%", "datasheet": "", "stock": 200, "price": "1-100:0.002"},
+    ]
+    mem_db.import_batch(parts)
+    alts = mem_db.suggest_alternatives("C25744")
+    lcscs = [a["lcsc"] for a in alts]
+    assert "C99001" in lcscs       # same value: kept
+    assert "C25101" not in lcscs   # different value: filtered out
+
+
+def test_suggest_alternatives_filters_capacitor_by_dielectric(mem_db):
+    """An X7R cap should not propose a Y5V cap as alternative (worse stability)."""
+    parts = [
+        {"lcscPart": "C1525", "firstCategory": "Capacitors", "secondCategory": "Multilayer Ceramic Capacitors MLCC - SMD/SMT",
+         "mfrPart": "X1", "package": "0402", "solderJoint": 2, "manufacturer": "M",
+         "libraryType": "base", "description": "100nF ±10% 25V X7R", "datasheet": "", "stock": 1000, "price": "1-100:0.002"},
+        {"lcscPart": "C200", "firstCategory": "Capacitors", "secondCategory": "Multilayer Ceramic Capacitors MLCC - SMD/SMT",
+         "mfrPart": "Y1", "package": "0402", "solderJoint": 2, "manufacturer": "Other",
+         "libraryType": "extend", "description": "100nF ±20% 16V Y5V", "datasheet": "", "stock": 1000, "price": "1-100:0.001"},
+        {"lcscPart": "C201", "firstCategory": "Capacitors", "secondCategory": "Multilayer Ceramic Capacitors MLCC - SMD/SMT",
+         "mfrPart": "X2", "package": "0402", "solderJoint": 2, "manufacturer": "Other",
+         "libraryType": "extend", "description": "100nF ±10% 50V X7R", "datasheet": "", "stock": 1000, "price": "1-100:0.001"},
+    ]
+    mem_db.import_batch(parts)
+    alts = mem_db.suggest_alternatives("C1525")
+    lcscs = [a["lcsc"] for a in alts]
+    assert "C201" in lcscs   # X7R ↔ X7R
+    assert "C200" not in lcscs  # Y5V rejected
+
+
+def test_suggest_alternatives_falls_back_when_no_specs(mem_db):
+    """Non-passive (IC) → spec lookup returns None; falls back to category+package match."""
+    parts = [
+        {"lcscPart": "C20734", "firstCategory": "Integrated Circuits", "secondCategory": "Microcontrollers",
+         "mfrPart": "STM32F103", "package": "LQFP-48", "solderJoint": 48, "manufacturer": "ST",
+         "libraryType": "extend", "description": "32-bit MCU", "datasheet": "", "stock": 1000, "price": "1-10:2.5"},
+        {"lcscPart": "C99999", "firstCategory": "Integrated Circuits", "secondCategory": "Microcontrollers",
+         "mfrPart": "STM32F100", "package": "LQFP-48", "solderJoint": 48, "manufacturer": "ST",
+         "libraryType": "extend", "description": "32-bit MCU lite", "datasheet": "", "stock": 500, "price": "1-10:2.0"},
+    ]
+    mem_db.import_batch(parts)
+    alts = mem_db.suggest_alternatives("C20734")
+    assert any(a["lcsc"] == "C99999" for a in alts)
     with pytest.raises(Exception):
         db._conn.execute("SELECT 1")

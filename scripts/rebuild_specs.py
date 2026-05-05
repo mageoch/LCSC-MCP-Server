@@ -14,7 +14,7 @@ from pathlib import Path
 # Allow running from the project root without installing the package
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from lcsc_mcp.db import PartsDB, _extract_specs, _component_type
+from jlcpcb_mcp.db import PartsDB, _extract_specs, _component_type
 
 
 def main() -> None:

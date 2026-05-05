@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from lcsc_mcp.db import PartsDB
+from jlcpcb_mcp.db import PartsDB
 
 _REQUIRED_CREDS = ("JLCPCB_APP_ID", "JLCPCB_API_KEY", "JLCPCB_API_SECRET")
 

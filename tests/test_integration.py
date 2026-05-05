@@ -25,8 +25,8 @@ those are Extended (lib=expand).  150 kΩ is Basic in 0805 (C17470).
 
 import pytest
 
-from lcsc_mcp.client import JLCPCBClient
-from lcsc_mcp.db import PartsDB
+from jlcpcb_mcp.client import JLCPCBClient
+from jlcpcb_mcp.db import PartsDB
 
 pytestmark = pytest.mark.integration
 
@@ -60,14 +60,8 @@ def basic_db(live_client):
     getComponentDetailByCode.  Fast: one small API call for ~5 codes.
     """
     codes = list(KNOWN_BASIC_0402.keys()) + [KNOWN_BASIC_0805_150K]
-    raw = live_client._post(
-        "/overseas/openapi/component/getComponentDetailByCode",
-        {"componentCodes": codes},
-    )
-    assert isinstance(raw, list) and raw, (
-        f"Detail endpoint returned no data for codes {codes}"
-    )
-    parts = [live_client._normalize_detail(r) for r in raw]
+    parts = live_client.get_parts_details(codes)
+    assert parts, f"Detail endpoint returned no data for codes {codes}"
     db = PartsDB(":memory:")
     db.import_batch(parts)
     db.rebuild_fts()
@@ -95,30 +89,42 @@ def test_client_get_part_detail_returns_none_for_unknown(live_client):
     assert result is None
 
 
-def test_client_library_list_returns_basic_parts(live_client):
-    """getComponentLibraryList with library_type='base' must return stubs."""
-    stubs = live_client.get_library_list(library_type="base", current_page=1, page_size=100)
+def test_client_get_parts_details_batch(live_client):
+    """Batch lookup returns one normalized record per requested code."""
+    codes = list(KNOWN_BASIC_0402)
+    results = live_client.get_parts_details(codes)
+    assert len(results) == len(codes)
+    assert {r["lcscPart"] for r in results} >= set(codes)
+
+
+def test_client_library_list_returns_stubs(live_client):
+    """getComponentLibraryList returns a (stubs, next_key) tuple."""
+    stubs, next_key = live_client.get_library_list(page_size=100)
     assert len(stubs) > 0
     assert all("componentCode" in s for s in stubs)
+    # next_key may be None on the last page or a non-empty string when more pages remain.
+    assert next_key is None or isinstance(next_key, str)
 
 
-def test_client_library_list_page_size_respected(live_client):
-    """Requesting 10 items must return at most 10."""
-    stubs = live_client.get_library_list(library_type="base", current_page=1, page_size=10)
-    assert 0 < len(stubs) <= 10
+def test_client_library_list_pagination_advances(live_client):
+    """The cursor returned by page N must yield a different first stub on page N+1."""
+    page1, cursor = live_client.get_library_list(page_size=100)
+    assert page1 and cursor, "first page must be non-empty and have a follow-up cursor"
+    page2, _ = live_client.get_library_list(last_key=cursor, page_size=100)
+    assert page2, "second page must not be empty"
+    assert page1[0]["componentCode"] != page2[0]["componentCode"], (
+        "cursor did not advance — page 2 starts on the same stub as page 1"
+    )
 
 
-def test_client_library_list_total_size(live_client):
-    """Basic library must have at least 500 stubs across all pages."""
+def test_client_iter_library_stubs_total_size(live_client):
+    """The full assembly library must contain at least 500 stubs."""
     total = 0
-    for page in range(1, 50):
-        batch = live_client.get_library_list(library_type="base", current_page=page, page_size=1000)
-        if not batch:
+    for _ in live_client.iter_library_stubs():
+        total += 1
+        if total >= 500:
             break
-        total += len(batch)
-        if len(batch) < 1000:
-            break
-    assert total >= 500, f"Only {total} Basic library stubs — suspiciously low"
+    assert total >= 500, f"Only {total} library stubs — suspiciously low"
 
 
 # ---------------------------------------------------------------------------
