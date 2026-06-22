@@ -1313,6 +1313,223 @@ def search_smt_components(keyword: str, page: int = 1,
 
 
 # ---------------------------------------------------------------------------
+# Assembly (PCBA) tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_smt_component_detail(component_code: str) -> dict:
+    """
+    Get full details for a JLCPCB SMT component by its LCSC code.
+
+    No session cookie required.
+
+    Args:
+        component_code: LCSC code (e.g. "C8734", "C14663")
+    """
+    cart = _cart_client()
+    data = cart.get_smt_component_detail(component_code)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to get component detail")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def get_assembly_config() -> dict:
+    """
+    Get JLCPCB assembly configuration: fees, panel limits, order configs, and
+    available services (bake, conformal coating, etc.).
+
+    No session cookie required.
+    """
+    cart = _cart_client()
+    fees = cart.get_smt_config_fee()
+    panel = cart.get_smt_panel_config()
+    order_config = cart.get_smt_order_config()
+    services = cart.get_smt_service_list()
+    return {
+        "fees": fees.get("data", {}),
+        "panel_config": panel.get("data", {}),
+        "order_config": order_config.get("data", {}),
+        "services": services.get("data", {}),
+    }
+
+
+@mcp.tool()
+def upload_bom(file_path: str, dfm_record_key_id: str) -> dict:
+    """
+    Upload a BOM (Bill of Materials) file for PCBA assembly analysis.
+
+    The dfm_record_key_id is obtained when uploading Gerber files via the
+    JLCPCB PCB ordering flow. Supported formats: CSV, XLSX.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        file_path: Local path to the BOM file
+        dfm_record_key_id: DFM record key from the Gerber upload step
+    """
+    cart = _cart_client()
+    data = cart.upload_bom(file_path, dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "BOM upload failed")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def upload_cpl(file_path: str, dfm_record_key_id: str) -> dict:
+    """
+    Upload a CPL (Component Placement List / pick-and-place) file for assembly.
+
+    The dfm_record_key_id is obtained when uploading Gerber files.
+    Supported formats: CSV, XLSX.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        file_path: Local path to the CPL file
+        dfm_record_key_id: DFM record key from the Gerber upload step
+    """
+    cart = _cart_client()
+    data = cart.upload_cpl(file_path, dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "CPL upload failed")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def trigger_bom_analysis(dfm_record_key_id: str) -> dict:
+    """
+    Trigger DFM analysis of uploaded BOM + CPL files.
+
+    Call this after uploading both BOM and CPL files. The analysis runs
+    asynchronously — use check_bom_analysis_status to poll for completion.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key from the Gerber upload step
+    """
+    cart = _cart_client()
+    data = cart.trigger_bom_analysis(dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to trigger analysis")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def check_bom_analysis_status(dfm_record_key_id: str) -> dict:
+    """
+    Check the status of a BOM/CPL DFM analysis.
+
+    Poll this after trigger_bom_analysis until the status indicates completion.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key
+    """
+    cart = _cart_client()
+    data = cart.get_bom_analysis_status(dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to check status")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def get_bom_analysis_result(dfm_record_key_id: str) -> dict:
+    """
+    Get the results of a completed BOM/CPL DFM analysis.
+
+    Returns matched components, unmatched items, and any DFM issues found.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key
+    """
+    cart = _cart_client()
+    data = cart.get_bom_analysis_result(dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to get results")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def list_assembly_matched_components(dfm_record_key_id: str) -> dict:
+    """
+    List all matched SMT components from a BOM analysis.
+
+    Shows which BOM lines were matched to JLCPCB/LCSC parts and their details.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key
+    """
+    cart = _cart_client()
+    data = cart.list_matched_components(dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to list components")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def replace_assembly_component(dfm_record_key_id: str,
+                                original_component_code: str,
+                                new_component_code: str) -> dict:
+    """
+    Replace a matched component in the BOM with a different LCSC part.
+
+    Use this to fix incorrect matches or substitute unavailable parts.
+    Search for alternatives with search_smt_components first.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key
+        original_component_code: LCSC code of the component to replace
+        new_component_code: LCSC code of the replacement component
+    """
+    cart = _cart_client()
+    data = cart.replace_component({
+        "dfmRecordKeyId": dfm_record_key_id,
+        "originalComponentCode": original_component_code,
+        "newComponentCode": new_component_code,
+    })
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to replace component")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def toggle_assembly_component(dfm_record_key_id: str,
+                               component_code: str,
+                               selected: bool) -> dict:
+    """
+    Include or exclude a component from the assembly BOM.
+
+    Use this to deselect components you don't want assembled (e.g. through-hole
+    parts you'll solder manually).
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key
+        component_code: LCSC code of the component
+        selected: True to include in assembly, False to exclude
+    """
+    cart = _cart_client()
+    data = cart.update_component_selection({
+        "dfmRecordKeyId": dfm_record_key_id,
+        "componentCode": component_code,
+        "selectStatus": 1 if selected else 0,
+    })
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to update selection")}
+    return data.get("data", data)
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 

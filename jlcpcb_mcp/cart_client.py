@@ -1,9 +1,10 @@
 """
-JLCPCB shopping cart client — cookie-based session authentication.
+JLCPCB shopping cart & assembly client — cookie-based session authentication.
 
-Talks to cart.jlcpcb.com which proxies to JLCPCB's internal order platform.
+Talks to cart.jlcpcb.com (shopping cart), jlcpcb.com (component search),
+and jlcdfm.com (DFM/BOM analysis) for the full PCBA ordering workflow.
+
 Requires a JLCPCB_SESSION_COOKIE env var containing the user's browser cookies.
-
 The minimum required cookie is JLCPCB_SESSION_ID. For write operations
 (add/delete/edit), the XSRF-TOKEN cookie is also needed.
 
@@ -13,6 +14,7 @@ e.g.: "JLCPCB_SESSION_ID=abc123; XSRF-TOKEN=xyz789; ..."
 
 import logging
 import os
+from pathlib import Path
 from typing import Any
 
 import requests
@@ -21,6 +23,8 @@ from requests.adapters import HTTPAdapter
 logger = logging.getLogger(__name__)
 
 CART_BASE_URL = "https://cart.jlcpcb.com"
+JLCPCB_API_URL = "https://jlcpcb.com/api/overseas-pcb-order/v1"
+DFM_BASE_URL = "https://jlcdfm.com/api/overseas-dfm-service"
 
 
 def _require_session_cookie() -> str:
@@ -61,11 +65,7 @@ class JLCPCBCartClient:
         if self._xsrf:
             self._session.headers["X-XSRF-TOKEN"] = self._xsrf
 
-    def _post(self, path: str, payload: dict | None = None) -> dict[str, Any]:
-        url = f"{CART_BASE_URL}{path}"
-        resp = self._session.post(url, json=payload or {})
-        resp.raise_for_status()
-        data = resp.json()
+    def _check_auth(self, data: dict) -> dict:
         if data.get("code") == 460:
             raise PermissionError(
                 "JLCPCB session expired or invalid. Update JLCPCB_SESSION_COOKIE "
@@ -73,17 +73,34 @@ class JLCPCBCartClient:
             )
         return data
 
-    def _get(self, path: str, params: dict | None = None) -> dict[str, Any]:
-        url = f"{CART_BASE_URL}{path}"
+    def _post(self, path: str, payload: dict | None = None,
+              base_url: str = CART_BASE_URL,
+              params: dict | None = None) -> dict[str, Any]:
+        url = f"{base_url}{path}"
+        resp = self._session.post(url, json=payload or {}, params=params)
+        resp.raise_for_status()
+        return self._check_auth(resp.json())
+
+    def _get(self, path: str, params: dict | None = None,
+             base_url: str = CART_BASE_URL) -> dict[str, Any]:
+        url = f"{base_url}{path}"
         resp = self._session.get(url, params=params)
         resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") == 460:
-            raise PermissionError(
-                "JLCPCB session expired or invalid. Update JLCPCB_SESSION_COOKIE "
-                "with fresh cookies from your browser."
+        return self._check_auth(resp.json())
+
+    def _post_file(self, path: str, file_path: str, params: dict | None = None,
+                   base_url: str = DFM_BASE_URL) -> dict[str, Any]:
+        url = f"{base_url}{path}"
+        p = Path(file_path)
+        headers = {k: v for k, v in self._session.headers.items()
+                   if k.lower() != "content-type"}
+        with open(p, "rb") as f:
+            resp = self._session.post(
+                url, files={"file": (p.name, f)}, params=params,
+                headers=headers,
             )
-        return data
+        resp.raise_for_status()
+        return self._check_auth(resp.json())
 
     def show_cart(self) -> dict[str, Any]:
         return self._get("/shoppingCart/showCart")
@@ -137,4 +154,101 @@ class JLCPCBCartClient:
     def get_smt_component_detail(self, component_code: str) -> dict[str, Any]:
         return self._get("/shoppingCart/smtGood/getComponentDetail", {
             "componentCode": component_code,
+        })
+
+    def get_smt_component_suggest(self, keyword: str) -> dict[str, Any]:
+        return self._get(
+            "/shoppingCart/smtGood/getComponentSuggest",
+            params={"keyword": keyword},
+            base_url=JLCPCB_API_URL,
+        )
+
+    def get_hot_components(self) -> dict[str, Any]:
+        return self._get(
+            "/shoppingCart/smtGood/getHotComponent",
+            base_url=JLCPCB_API_URL,
+        )
+
+    # --- Assembly config (no auth required) ---
+
+    def get_smt_config_fee(self) -> dict[str, Any]:
+        return self._get("/shoppingCart/getSmtConfigFee")
+
+    def get_smt_panel_config(self) -> dict[str, Any]:
+        return self._get("/shoppingCart/getSmtPanelConfig")
+
+    def get_smt_order_config(self) -> dict[str, Any]:
+        return self._get("/order/getSmtOrderConfig")
+
+    def get_smt_service_list(self) -> dict[str, Any]:
+        return self._get("/shoppingCart/smtGood/getServiceNameList")
+
+    # --- BOM/CPL upload & DFM analysis (auth required) ---
+
+    def upload_bom(self, file_path: str, dfm_record_key_id: str) -> dict[str, Any]:
+        return self._post_file(
+            "/smtDfm/uploadBomCpl",
+            file_path,
+            params={"fileType": "bom", "dfmRecordKeyId": dfm_record_key_id},
+        )
+
+    def upload_cpl(self, file_path: str, dfm_record_key_id: str) -> dict[str, Any]:
+        return self._post_file(
+            "/smtDfm/uploadBomCpl",
+            file_path,
+            params={"fileType": "cpl", "dfmRecordKeyId": dfm_record_key_id},
+        )
+
+    def trigger_bom_analysis(self, dfm_record_key_id: str) -> dict[str, Any]:
+        return self._post(
+            "/smtDfm/analyzeFile",
+            params={"dfmRecordKeyId": dfm_record_key_id},
+            base_url=DFM_BASE_URL,
+        )
+
+    def get_bom_analysis_status(self, dfm_record_key_id: str) -> dict[str, Any]:
+        return self._post(
+            "/smtDfm/getAnalyzeStatus",
+            params={"dfmRecordKeyId": dfm_record_key_id},
+            base_url=DFM_BASE_URL,
+        )
+
+    def get_bom_analysis_result(self, dfm_record_key_id: str) -> dict[str, Any]:
+        return self._post(
+            "/smtDfm/getAnalyzeResult",
+            params={"dfmRecordKeyId": dfm_record_key_id},
+            base_url=DFM_BASE_URL,
+        )
+
+    def get_dfm_info(self, dfm_record_key_id: str) -> dict[str, Any]:
+        return self._get(
+            "/smtDfm/getSmtDfmInfo",
+            params={"dfmRecordKeyId": dfm_record_key_id},
+            base_url=DFM_BASE_URL,
+        )
+
+    def list_matched_components(self, dfm_record_key_id: str) -> dict[str, Any]:
+        return self._post(
+            "/smtDfm/listSmtGoodsDetail",
+            params={"dfmRecordKeyId": dfm_record_key_id},
+            base_url=DFM_BASE_URL,
+        )
+
+    def replace_component(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post(
+            "/smtDfm/replaceComponent",
+            payload=payload,
+            base_url=DFM_BASE_URL,
+        )
+
+    def update_component_selection(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._post(
+            "/smtDfm/updateSelectStatus",
+            payload=payload,
+            base_url=DFM_BASE_URL,
+        )
+
+    def get_unmatched_bom(self, smt_file_uuid: str) -> dict[str, Any]:
+        return self._post("/shoppingCart/smtGood/getNoMatchBomList", {
+            "smtFileUuid": smt_file_uuid,
         })
