@@ -1149,6 +1149,170 @@ def repair_db() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Cart management tools (cookie-based session auth)
+# ---------------------------------------------------------------------------
+
+def _cart_client():
+    from .cart_client import JLCPCBCartClient
+    return JLCPCBCartClient()
+
+
+def _fmt_money(val, currency="USD") -> str:
+    if val is None:
+        return "N/A"
+    return f"${val:,.4f}" if currency == "USD" else f"{val:,.2f} {currency}"
+
+
+@mcp.tool()
+def view_cart(business_type: str = "JLCPCB") -> dict:
+    """
+    View the current JLCPCB shopping cart.
+
+    Requires JLCPCB_SESSION_COOKIE env var with your browser session cookies.
+
+    Args:
+        business_type: Cart tab — "JLCPCB" (PCB/SMT), "JLC3DP", "JLCCNC", "JLCMC", "JLCFH"
+    """
+    cart = _cart_client()
+    data = cart.show_cart()
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to fetch cart")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def list_cart_items(page: int = 1, page_size: int = 10,
+                    business_type: str = "JLCPCB") -> dict:
+    """
+    List items in the JLCPCB shopping cart with pagination.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        page: Page number (default 1)
+        page_size: Items per page (default 10)
+        business_type: Cart tab — "JLCPCB", "JLC3DP", "JLCCNC", "JLCMC", "JLCFH"
+    """
+    cart = _cart_client()
+    data = cart.cart_page(page_num=page, page_size=page_size,
+                          business_type=business_type)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to list cart")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def get_cart_item_detail(cart_access_id: str) -> dict:
+    """
+    Get full details for a specific item in the cart.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        cart_access_id: The shoppingCartAccessId of the item (from list_cart_items)
+    """
+    cart = _cart_client()
+    data = cart.cart_detail(cart_access_id)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to get cart detail")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def delete_cart_items(cart_access_ids: list[str]) -> dict:
+    """
+    Delete one or more items from the JLCPCB shopping cart.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        cart_access_ids: List of shoppingCartAccessId values to remove
+    """
+    cart = _cart_client()
+    data = cart.delete_items(cart_access_ids)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to delete items")}
+    return {"success": True, "deleted": cart_access_ids}
+
+
+@mcp.tool()
+def calculate_cart_costs(cart_access_ids: list[str]) -> dict:
+    """
+    Calculate costs (pricing, shipping estimates) for selected cart items.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        cart_access_ids: List of shoppingCartAccessId values to calculate
+    """
+    cart = _cart_client()
+    data = cart.calculate_costs(cart_access_ids)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to calculate costs")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def get_shipping_options(cart_access_ids: list[str]) -> dict:
+    """
+    Get available shipping methods and costs for selected cart items.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        cart_access_ids: List of shoppingCartAccessId values
+    """
+    cart = _cart_client()
+    data = cart.query_shipping(cart_access_ids)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to get shipping options")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def search_smt_components(keyword: str, page: int = 1,
+                          page_size: int = 20) -> dict:
+    """
+    Search JLCPCB's SMT assembly component catalog.
+
+    No session cookie required — this endpoint is public.
+    Returns components available for PCBA with stock levels and tiered pricing.
+
+    Args:
+        keyword: Search query (e.g. "STM32", "100nF 0402", "C14663")
+        page: Page number (default 1)
+        page_size: Results per page, max 100 (default 20)
+    """
+    cart = _cart_client()
+    data = cart.search_smt_components(keyword, page=page,
+                                       page_size=min(page_size, 100))
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Search failed")}
+    result = data.get("data", {}).get("componentPageInfo", {})
+    total = result.get("total", 0)
+    components = result.get("list", [])
+    out = {"total": total, "page": page, "components": []}
+    for c in components:
+        prices = c.get("componentPrices", [])
+        price_tiers = [
+            {"min_qty": p["startNumber"], "max_qty": p["endNumber"],
+             "unit_price": p["productPrice"]}
+            for p in prices
+        ]
+        out["components"].append({
+            "lcsc_code": f"C{c['componentId']}" if isinstance(c.get("componentId"), int) else c.get("componentCode", ""),
+            "type": c.get("componentLibraryType", ""),
+            "category": c.get("componentTypeEn", ""),
+            "description": c.get("describe", c.get("erpComponentName", "")),
+            "stock": c.get("stockCount", 0),
+            "price_tiers": price_tiers,
+            "package": c.get("componentSpecificationEn", ""),
+            "lcsc_url": c.get("lcscGoodsUrl", ""),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
