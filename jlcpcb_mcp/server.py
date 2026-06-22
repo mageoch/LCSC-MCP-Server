@@ -1149,6 +1149,387 @@ def repair_db() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Cart management tools (cookie-based session auth)
+# ---------------------------------------------------------------------------
+
+def _cart_client():
+    from .cart_client import JLCPCBCartClient
+    return JLCPCBCartClient()
+
+
+def _fmt_money(val, currency="USD") -> str:
+    if val is None:
+        return "N/A"
+    return f"${val:,.4f}" if currency == "USD" else f"{val:,.2f} {currency}"
+
+
+@mcp.tool()
+def view_cart(business_type: str = "JLCPCB") -> dict:
+    """
+    View the current JLCPCB shopping cart.
+
+    Requires JLCPCB_SESSION_COOKIE env var with your browser session cookies.
+
+    Args:
+        business_type: Cart tab — "JLCPCB" (PCB/SMT), "JLC3DP", "JLCCNC", "JLCMC", "JLCFH"
+    """
+    cart = _cart_client()
+    data = cart.show_cart()
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to fetch cart")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def list_cart_items(page: int = 1, page_size: int = 10,
+                    business_type: str = "JLCPCB") -> dict:
+    """
+    List items in the JLCPCB shopping cart with pagination.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        page: Page number (default 1)
+        page_size: Items per page (default 10)
+        business_type: Cart tab — "JLCPCB", "JLC3DP", "JLCCNC", "JLCMC", "JLCFH"
+    """
+    cart = _cart_client()
+    data = cart.cart_page(page_num=page, page_size=page_size,
+                          business_type=business_type)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to list cart")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def get_cart_item_detail(cart_access_id: str) -> dict:
+    """
+    Get full details for a specific item in the cart.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        cart_access_id: The shoppingCartAccessId of the item (from list_cart_items)
+    """
+    cart = _cart_client()
+    data = cart.cart_detail(cart_access_id)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to get cart detail")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def delete_cart_items(cart_access_ids: list[str]) -> dict:
+    """
+    Delete one or more items from the JLCPCB shopping cart.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        cart_access_ids: List of shoppingCartAccessId values to remove
+    """
+    cart = _cart_client()
+    data = cart.delete_items(cart_access_ids)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to delete items")}
+    return {"success": True, "deleted": cart_access_ids}
+
+
+@mcp.tool()
+def calculate_cart_costs(cart_access_ids: list[str]) -> dict:
+    """
+    Calculate costs (pricing, shipping estimates) for selected cart items.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        cart_access_ids: List of shoppingCartAccessId values to calculate
+    """
+    cart = _cart_client()
+    data = cart.calculate_costs(cart_access_ids)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to calculate costs")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def get_shipping_options(cart_access_ids: list[str]) -> dict:
+    """
+    Get available shipping methods and costs for selected cart items.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        cart_access_ids: List of shoppingCartAccessId values
+    """
+    cart = _cart_client()
+    data = cart.query_shipping(cart_access_ids)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to get shipping options")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def search_smt_components(keyword: str, page: int = 1,
+                          page_size: int = 20) -> dict:
+    """
+    Search JLCPCB's SMT assembly component catalog.
+
+    No session cookie required — this endpoint is public.
+    Returns components available for PCBA with stock levels and tiered pricing.
+
+    Args:
+        keyword: Search query (e.g. "STM32", "100nF 0402", "C14663")
+        page: Page number (default 1)
+        page_size: Results per page, max 100 (default 20)
+    """
+    cart = _cart_client()
+    data = cart.search_smt_components(keyword, page=page,
+                                       page_size=min(page_size, 100))
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Search failed")}
+    result = data.get("data", {}).get("componentPageInfo", {})
+    total = result.get("total", 0)
+    components = result.get("list", [])
+    out = {"total": total, "page": page, "components": []}
+    for c in components:
+        prices = c.get("componentPrices", [])
+        price_tiers = [
+            {"min_qty": p["startNumber"], "max_qty": p["endNumber"],
+             "unit_price": p["productPrice"]}
+            for p in prices
+        ]
+        out["components"].append({
+            "lcsc_code": f"C{c['componentId']}" if isinstance(c.get("componentId"), int) else c.get("componentCode", ""),
+            "type": c.get("componentLibraryType", ""),
+            "category": c.get("componentTypeEn", ""),
+            "description": c.get("describe", c.get("erpComponentName", "")),
+            "stock": c.get("stockCount", 0),
+            "price_tiers": price_tiers,
+            "package": c.get("componentSpecificationEn", ""),
+            "lcsc_url": c.get("lcscGoodsUrl", ""),
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Assembly (PCBA) tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_smt_component_detail(component_code: str) -> dict:
+    """
+    Get full details for a JLCPCB SMT component by its LCSC code.
+
+    No session cookie required.
+
+    Args:
+        component_code: LCSC code (e.g. "C8734", "C14663")
+    """
+    cart = _cart_client()
+    data = cart.get_smt_component_detail(component_code)
+    if data.get("code") != 200:
+        return {"error": data.get("message", "Failed to get component detail")}
+    return data.get("data", {})
+
+
+@mcp.tool()
+def get_assembly_config() -> dict:
+    """
+    Get JLCPCB assembly configuration: fees, panel limits, order configs, and
+    available services (bake, conformal coating, etc.).
+
+    No session cookie required.
+    """
+    cart = _cart_client()
+    fees = cart.get_smt_config_fee()
+    panel = cart.get_smt_panel_config()
+    order_config = cart.get_smt_order_config()
+    services = cart.get_smt_service_list()
+    return {
+        "fees": fees.get("data", {}),
+        "panel_config": panel.get("data", {}),
+        "order_config": order_config.get("data", {}),
+        "services": services.get("data", {}),
+    }
+
+
+@mcp.tool()
+def upload_bom(file_path: str, dfm_record_key_id: str) -> dict:
+    """
+    Upload a BOM (Bill of Materials) file for PCBA assembly analysis.
+
+    The dfm_record_key_id is obtained when uploading Gerber files via the
+    JLCPCB PCB ordering flow. Supported formats: CSV, XLSX.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        file_path: Local path to the BOM file
+        dfm_record_key_id: DFM record key from the Gerber upload step
+    """
+    cart = _cart_client()
+    data = cart.upload_bom(file_path, dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "BOM upload failed")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def upload_cpl(file_path: str, dfm_record_key_id: str) -> dict:
+    """
+    Upload a CPL (Component Placement List / pick-and-place) file for assembly.
+
+    The dfm_record_key_id is obtained when uploading Gerber files.
+    Supported formats: CSV, XLSX.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        file_path: Local path to the CPL file
+        dfm_record_key_id: DFM record key from the Gerber upload step
+    """
+    cart = _cart_client()
+    data = cart.upload_cpl(file_path, dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "CPL upload failed")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def trigger_bom_analysis(dfm_record_key_id: str) -> dict:
+    """
+    Trigger DFM analysis of uploaded BOM + CPL files.
+
+    Call this after uploading both BOM and CPL files. The analysis runs
+    asynchronously — use check_bom_analysis_status to poll for completion.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key from the Gerber upload step
+    """
+    cart = _cart_client()
+    data = cart.trigger_bom_analysis(dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to trigger analysis")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def check_bom_analysis_status(dfm_record_key_id: str) -> dict:
+    """
+    Check the status of a BOM/CPL DFM analysis.
+
+    Poll this after trigger_bom_analysis until the status indicates completion.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key
+    """
+    cart = _cart_client()
+    data = cart.get_bom_analysis_status(dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to check status")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def get_bom_analysis_result(dfm_record_key_id: str) -> dict:
+    """
+    Get the results of a completed BOM/CPL DFM analysis.
+
+    Returns matched components, unmatched items, and any DFM issues found.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key
+    """
+    cart = _cart_client()
+    data = cart.get_bom_analysis_result(dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to get results")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def list_assembly_matched_components(dfm_record_key_id: str) -> dict:
+    """
+    List all matched SMT components from a BOM analysis.
+
+    Shows which BOM lines were matched to JLCPCB/LCSC parts and their details.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key
+    """
+    cart = _cart_client()
+    data = cart.list_matched_components(dfm_record_key_id)
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to list components")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def replace_assembly_component(dfm_record_key_id: str,
+                                original_component_code: str,
+                                new_component_code: str) -> dict:
+    """
+    Replace a matched component in the BOM with a different LCSC part.
+
+    Use this to fix incorrect matches or substitute unavailable parts.
+    Search for alternatives with search_smt_components first.
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key
+        original_component_code: LCSC code of the component to replace
+        new_component_code: LCSC code of the replacement component
+    """
+    cart = _cart_client()
+    data = cart.replace_component({
+        "dfmRecordKeyId": dfm_record_key_id,
+        "originalComponentCode": original_component_code,
+        "newComponentCode": new_component_code,
+    })
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to replace component")}
+    return data.get("data", data)
+
+
+@mcp.tool()
+def toggle_assembly_component(dfm_record_key_id: str,
+                               component_code: str,
+                               selected: bool) -> dict:
+    """
+    Include or exclude a component from the assembly BOM.
+
+    Use this to deselect components you don't want assembled (e.g. through-hole
+    parts you'll solder manually).
+
+    Requires JLCPCB_SESSION_COOKIE env var.
+
+    Args:
+        dfm_record_key_id: DFM record key
+        component_code: LCSC code of the component
+        selected: True to include in assembly, False to exclude
+    """
+    cart = _cart_client()
+    data = cart.update_component_selection({
+        "dfmRecordKeyId": dfm_record_key_id,
+        "componentCode": component_code,
+        "selectStatus": 1 if selected else 0,
+    })
+    if data.get("code") not in (200, None) and not data.get("success"):
+        return {"error": data.get("message", "Failed to update selection")}
+    return data.get("data", data)
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
